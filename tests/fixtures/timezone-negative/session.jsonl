@@ -1,0 +1,1 @@
+{"type":"user","uuid":"negative-boundary","parentUuid":null,"sessionId":"test-session-negative","timestamp":"2026-09-18T02:30:00Z","cwd":"/tmp/fake-project","isSidechain":false,"origin":{"kind":"human"},"message":{"content":"verify the negative offset boundary"}}

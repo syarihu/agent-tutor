@@ -1,0 +1,30 @@
+[package]
+name = "agent-tutor"
+version = "0.1.0"
+edition = "2024"
+description = "Nurtures AI coding agents by extracting human feedback from transcripts into rules, memory, and an interactive review UI"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/syarihu/agent-tutor"
+keywords = ["claude-code", "mcp", "ai", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "tutor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tutor"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true

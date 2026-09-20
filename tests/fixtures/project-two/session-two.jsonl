@@ -1,0 +1,2 @@
+{"type":"user","uuid":"common-2","parentUuid":null,"sessionId":"test-session-2","timestamp":"2026-09-17T03:00:00Z","cwd":"/tmp/fake-project","isSidechain":false,"origin":{"kind":"human"},"message":{"content":"AUTOMATED START PROMPT"}}
+{"type":"user","uuid":"shared-2","parentUuid":"common-2","sessionId":"test-session-2","timestamp":"2026-09-17T03:01:00Z","cwd":"/tmp/fake-project","isSidechain":false,"origin":{"kind":"human"},"message":{"content":"prompt shared by two sessions"}}

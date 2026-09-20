@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tutor Feedback Review</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card-bg: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #238636;
+    --green-bg: rgba(35, 134, 54, 0.2);
+    --red: #da3633;
+    --red-bg: rgba(218, 54, 51, 0.2);
+    --yellow: #d29922;
+    --yellow-bg: rgba(210, 153, 34, 0.2);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    padding-bottom: 80px;
+  }
+  header {
+    position: sticky;
+    top: 0;
+    background: rgba(22, 27, 34, 0.95);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    z-index: 100;
+  }
+  .title-area { display: flex; align-items: center; gap: 12px; }
+  h1 { font-size: 18px; font-weight: 600; color: #f0f6fc; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .badge-app { background: var(--green-bg); color: #3fb950; border: 1px solid rgba(63, 185, 80, 0.4); }
+  .badge-rej { background: var(--red-bg); color: #f85149; border: 1px solid rgba(248, 81, 73, 0.4); }
+  .badge-def { background: var(--yellow-bg); color: #e3b341; border: 1px solid rgba(227, 179, 65, 0.4); }
+  .btn-submit {
+    background: var(--green);
+    color: #fff;
+    border: none;
+    padding: 8px 20px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .btn-submit:hover { opacity: 0.9; }
+  .container { max-width: 960px; margin: 24px auto; padding: 0 16px; }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 20px;
+    overflow: hidden;
+  }
+  .card-header {
+    background: rgba(255, 255, 255, 0.02);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .card-header-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .card-id { font-size: 13px; font-weight: 600; color: var(--accent); }
+  .card-meta { font-size: 12px; color: var(--text-muted); }
+  .btn-group { display: flex; gap: 6px; }
+  .btn-opt {
+    background: #21262d;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    padding: 5px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-opt.active-app { background: var(--green); color: #fff; border-color: var(--green); }
+  .btn-opt.active-rej { background: var(--red); color: #fff; border-color: var(--red); }
+  .btn-opt.active-def { background: var(--yellow); color: #000; border-color: var(--yellow); }
+  .card-body { padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+  .section-label { font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); margin-bottom: 4px; }
+  .human-box {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    padding: 10px 14px;
+    border-radius: 4px;
+    font-size: 14px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  details {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+  summary { cursor: pointer; color: var(--text-muted); outline: none; font-weight: 500; }
+  .assistant-box { margin-top: 8px; color: #8b949e; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+  .form-row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .form-group { flex: 1; min-width: 240px; }
+  select, input[type="text"], textarea {
+    width: 100%;
+    background: #0d1117;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    outline: none;
+    font-family: inherit;
+  }
+  select:focus, input[type="text"]:focus, textarea:focus { border-color: var(--accent); }
+  textarea.reason-box {
+    line-height: 1.5;
+    resize: vertical;
+    white-space: pre-wrap;
+    word-break: break-word;
+    min-height: 38px;
+    overflow-y: hidden;
+  }
+  .comment-group {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    transition: border-color 0.2s, background-color 0.2s;
+  }
+  .comment-group.status-app {
+    border-color: rgba(63, 185, 80, 0.4);
+    background: rgba(35, 134, 54, 0.05);
+  }
+  .comment-group.status-rej {
+    border-color: rgba(248, 81, 73, 0.4);
+    background: rgba(218, 54, 51, 0.05);
+  }
+  .comment-group.status-def {
+    border-color: rgba(227, 179, 65, 0.4);
+    background: rgba(210, 153, 34, 0.05);
+  }
+  .comment-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  .comment-label.status-app { color: #3fb950; }
+  .comment-label.status-rej { color: #f85149; }
+  .comment-label.status-def { color: #e3b341; }
+  textarea.comment-box {
+    line-height: 1.5;
+    resize: vertical;
+    white-space: pre-wrap;
+    word-break: break-word;
+    min-height: 38px;
+    overflow-y: hidden;
+    background: #0d1117;
+  }
+  .diff-container {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  .diff-header {
+    background: #161b22;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .diff-content { padding: 8px 0; overflow-x: auto; line-height: 1.4; }
+  .diff-line { padding: 1px 12px; white-space: pre; }
+  .diff-add { background: var(--green-bg); color: #7ee787; }
+  .diff-del { background: var(--red-bg); color: #ffa198; }
+  .diff-hunk { color: #79c0ff; font-weight: 600; background: rgba(56, 139, 253, 0.1); }
+  .empty-state { text-align: center; padding: 60px 20px; color: var(--text-muted); }
+  #completed-screen {
+    display: none;
+    text-align: center;
+    padding: 80px 20px;
+  }
+  #completed-screen h2 { font-size: 24px; color: #3fb950; margin-bottom: 12px; }
+  #completed-screen p { color: var(--text-muted); font-size: 15px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title-area">
+    <h1>Tutor Review</h1>
+    <span class="badge badge-app" id="cnt-app">承認: 0</span>
+    <span class="badge badge-rej" id="cnt-rej">却下: 0</span>
+    <span class="badge badge-def" id="cnt-def">保留: 0</span>
+  </div>
+  <button class="btn-submit" id="btn-submit" onclick="submitReview()">確定して反映 (Submit)</button>
+</header>
+
+<div class="container" id="main-view">
+  <div id="cards-container">
+    <div class="empty-state">レビュー対象を読み込み中...</div>
+  </div>
+</div>
+
+<div class="container" id="completed-screen">
+  <h2>✓ レビューを確定しました！</h2>
+  <p>エージェント（Claude Code）の画面に戻って作業を続けてください。<br>このタブは閉じて構いません。</p>
+</div>
+
+<script>
+let reviewItems = [];
+let availableDestinations = [
+  { id: "project_claude", label: "project_claude (リポジトリの CLAUDE.md)", category: "conventions" },
+  { id: "project_agents", label: "project_agents (リポジトリの AGENTS.md)", category: "conventions" },
+  { id: "global_claude", label: "global_claude (~/.claude/CLAUDE.md)", category: "conventions" },
+  { id: "global_agents", label: "global_agents (グローバルの AGENTS.md)", category: "conventions" },
+  { id: "project_docs", label: "project_docs (docs/ 詳細ドキュメント)", category: "documentation" },
+  { id: "user_memory", label: "user_memory (memory/ 観察メモ)", category: "memory" },
+  { id: "workflow_skill", label: "workflow_skill (.claude/skills/ スキル手順)", category: "workflow" },
+  { id: "discard", label: "discard (反映不要・捨てる)", category: "discard" }
+];
+
+async function loadData() {
+  try {
+    const [itemsRes, destRes] = await Promise.all([
+      fetch("/api/items"),
+      fetch("/api/destinations").catch(() => null)
+    ]);
+    reviewItems = await itemsRes.json();
+    if (destRes && destRes.ok) {
+      const destList = await destRes.json();
+      if (Array.isArray(destList) && destList.length > 0) {
+        availableDestinations = destList.filter(d => d.enabled !== false);
+      }
+    }
+    renderCards();
+    updateCounts();
+  } catch (err) {
+    document.getElementById("cards-container").innerHTML =
+      `<div class="empty-state">データの読み込みに失敗しました: ${err}</div>`;
+  }
+}
+
+function updateCounts() {
+  const app = reviewItems.filter(i => i.status === "approved").length;
+  const rej = reviewItems.filter(i => i.status === "rejected").length;
+  const def = reviewItems.filter(i => i.status === "deferred").length;
+  document.getElementById("cnt-app").textContent = `承認: ${app}`;
+  document.getElementById("cnt-rej").textContent = `却下: ${rej}`;
+  document.getElementById("cnt-def").textContent = `保留: ${def}`;
+  document.getElementById("btn-submit").textContent = `確定して反映 (${app}件 承認)`;
+}
+
+function getCommentMeta(status) {
+  if (status === "approved") {
+    return {
+      cls: "app",
+      label: "✓ 承認時の追加指示・メモ",
+      hint: "反映時にLLMが参照します (任意)",
+      placeholder: "追加の指示があれば入力（例: このセクションの末尾に追加して、既存の規約と統合して）"
+    };
+  } else if (status === "rejected") {
+    return {
+      cls: "rej",
+      label: "✗ 却下理由",
+      hint: "台帳に記録されます (推奨)",
+      placeholder: "却下の理由を入力（例: 個人設定のため不要、別のドキュメントで対応済み、など）"
+    };
+  } else {
+    return {
+      cls: "def",
+      label: "⏸ 保留理由・次回アクション",
+      hint: "台帳に記録されます (任意)",
+      placeholder: "保留理由・確認事項を入力（例: 次週のMTGで確認後に判断、PRマージ待ち）"
+    };
+  }
+}
+
+function setStatus(index, status) {
+  reviewItems[index].status = status;
+  if (status === "rejected") {
+    reviewItems[index].destination = "discard";
+    const sel = document.getElementById(`dest-${index}`);
+    if (sel) sel.value = "discard";
+  }
+  renderCards();
+  updateCounts();
+
+  if (status === "rejected" || status === "deferred") {
+    const commentEl = document.getElementById(`comment-${index}`);
+    if (commentEl) commentEl.focus();
+  }
+}
+
+function updateDestination(index, val) {
+  reviewItems[index].destination = val;
+  if (val === "discard") {
+    reviewItems[index].status = "rejected";
+  } else if (reviewItems[index].status === "rejected") {
+    reviewItems[index].status = "approved";
+  }
+  renderCards();
+  updateCounts();
+}
+
+function autoResize(el) {
+  el.style.height = "auto";
+  el.style.height = Math.max(el.scrollHeight, 38) + "px";
+}
+
+function updateReason(index, el) {
+  reviewItems[index].reason = el.value;
+  autoResize(el);
+}
+
+function updateUserComment(index, el) {
+  reviewItems[index].user_comment = el.value;
+  autoResize(el);
+}
+
+function updateDiff(index, val) {
+  reviewItems[index].draft_diff = val;
+}
+
+function toggleDiffEdit(index) {
+  const preview = document.getElementById(`diff-preview-${index}`);
+  const editor = document.getElementById(`diff-editor-${index}`);
+  const btn = document.getElementById(`btn-toggle-${index}`);
+  if (editor.style.display === "none") {
+    editor.style.display = "block";
+    preview.style.display = "none";
+    btn.textContent = "プレビューに戻す";
+  } else {
+    editor.style.display = "none";
+    preview.style.display = "block";
+    btn.textContent = "編集";
+    renderDiffPreview(index);
+  }
+}
+
+function renderDiffPreview(index) {
+  const preview = document.getElementById(`diff-preview-${index}`);
+  const diff = reviewItems[index].draft_diff || "";
+  if (!diff.trim()) {
+    preview.innerHTML = `<div class="diff-line" style="color:var(--text-muted);">_(差分なし)_</div>`;
+    return;
+  }
+  const lines = diff.split("\n");
+  preview.innerHTML = lines.map(line => {
+    let cls = "diff-line";
+    if (line.startsWith("+")) cls += " diff-add";
+    else if (line.startsWith("-")) cls += " diff-del";
+    else if (line.startsWith("@@")) cls += " diff-hunk";
+    return `<div class="${cls}">${escapeHtml(line)}</div>`;
+  }).join("");
+}
+
+function escapeHtml(text) {
+  const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+  return text.replace(/[&<>"']/g, m => map[m]);
+}
+
+function renderCards() {
+  const container = document.getElementById("cards-container");
+  if (reviewItems.length === 0) {
+    container.innerHTML = `<div class="empty-state">レビュー対象の指摘はありません。</div>`;
+    return;
+  }
+
+  container.innerHTML = reviewItems.map((item, idx) => {
+    const isApp = item.status === "approved";
+    const isRej = item.status === "rejected";
+    const isDef = item.status === "deferred";
+    const meta = getCommentMeta(item.status);
+
+    // Ensure item's destination is in the list even if custom
+    let destList = [...availableDestinations];
+    if (item.destination && !destList.some(d => d.id === item.destination)) {
+      destList.push({ id: item.destination, label: item.destination });
+    }
+
+    const destOptions = destList.map(d =>
+      `<option value="${d.id}" ${d.id === item.destination ? "selected" : ""}>${d.label}</option>`
+    ).join("");
+
+    const destDef = destList.find(d => d.id === item.destination);
+    const isIssue = destDef && (destDef.category === "issue" || item.destination.startsWith("issue_"));
+    const isKnowledge = destDef && (destDef.category === "knowledge" || item.destination.startsWith("knowledge_"));
+    const isSkill = destDef && (destDef.category === "workflow" || item.destination.includes("skill"));
+    const isMemory = destDef && (destDef.category === "memory" || item.destination.includes("memory"));
+    const diffTitle = isIssue ? "起票ドラフト (タイトル・本文)"
+      : isKnowledge ? "ナレッジ登録ドラフト"
+      : isSkill ? "スキル作成ドラフト (.claude/skills/…/SKILL.md)"
+      : isMemory ? "メモリ作成ドラフト (memory/…)"
+      : "適用差分ドラフト (DIFF)";
+
+    return `
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-top">
+          <div>
+            <span class="card-id">#${idx + 1} Turn ${item.turn_index}</span>
+            <span class="card-meta"> &bull; ${escapeHtml(item.cwd || item.session)}</span>
+          </div>
+          <div class="btn-group">
+            <button class="btn-opt ${isApp ? "active-app" : ""}" onclick="setStatus(${idx}, 'approved')">✓ 承認</button>
+            <button class="btn-opt ${isRej ? "active-rej" : ""}" onclick="setStatus(${idx}, 'rejected')">✗ 却下</button>
+            <button class="btn-opt ${isDef ? "active-def" : ""}" onclick="setStatus(${idx}, 'deferred')">⏸ 保留</button>
+          </div>
+        </div>
+
+        <div class="comment-group status-${meta.cls}" id="comment-group-${idx}">
+          <div class="comment-label status-${meta.cls}" id="comment-label-${idx}">
+            <span>${meta.label}</span>
+            <span style="font-size:11px; font-weight:normal; opacity:0.8;">${meta.hint}</span>
+          </div>
+          <textarea id="comment-${idx}" class="comment-box" rows="1"
+                    placeholder="${meta.placeholder}"
+                    oninput="updateUserComment(${idx}, this)">${escapeHtml(item.user_comment || "")}</textarea>
+        </div>
+      </div>
+      <div class="card-body">
+        <div>
+          <div class="section-label">人間の発言 (指摘・指示)</div>
+          <div class="human-box">${escapeHtml(item.human)}</div>
+        </div>
+
+        ${item.prev_assistant ? `
+        <details>
+          <summary>直前のアシスタント発言の末尾</summary>
+          <div class="assistant-box">${escapeHtml(item.prev_assistant)}</div>
+        </details>` : ""}
+
+        <div class="form-row">
+          <div class="form-group" style="flex: 0 0 260px;">
+            <div class="section-label">提案宛先</div>
+            <select id="dest-${idx}" onchange="updateDestination(${idx}, this.value)">
+              ${destOptions}
+            </select>
+          </div>
+          <div class="form-group" style="flex: 1; min-width: 280px;">
+            <div class="section-label">提案理由</div>
+            <textarea id="reason-${idx}" class="reason-box" rows="2"
+                      placeholder="提案理由"
+                      oninput="updateReason(${idx}, this)">${escapeHtml(item.reason || "")}</textarea>
+          </div>
+        </div>
+
+        <div>
+          <div class="section-label" style="display:flex; justify-content:space-between; align-items:center;">
+            <span>${diffTitle}</span>
+            <button class="btn-opt" id="btn-toggle-${idx}" onclick="toggleDiffEdit(${idx})">編集</button>
+          </div>
+          <div class="diff-container">
+            <div class="diff-content" id="diff-preview-${idx}"></div>
+            <textarea id="diff-editor-${idx}" style="display:none; height:180px; font-family:inherit; border:none; border-radius:0;"
+                      oninput="updateDiff(${idx}, this.value)">${escapeHtml(item.draft_diff || "")}</textarea>
+          </div>
+        </div>
+      </div>
+    </div>
+    `;
+  }).join("");
+
+  reviewItems.forEach((_, idx) => {
+    renderDiffPreview(idx);
+    const reasonEl = document.getElementById(`reason-${idx}`);
+    if (reasonEl) autoResize(reasonEl);
+    const commentEl = document.getElementById(`comment-${idx}`);
+    if (commentEl) autoResize(commentEl);
+  });
+}
+
+async function submitReview() {
+  const btn = document.getElementById("btn-submit");
+  btn.disabled = true;
+  btn.textContent = "送信中...";
+
+  try {
+    const res = await fetch("/api/submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items: reviewItems })
+    });
+
+    if (!res.ok) throw new Error("サーバーからエラーが返されました");
+
+    document.getElementById("main-view").style.display = "none";
+    document.querySelector("header").style.display = "none";
+    document.getElementById("completed-screen").style.display = "block";
+  } catch (err) {
+    alert("送信に失敗しました: " + err);
+    btn.disabled = false;
+    updateCounts();
+  }
+}
+
+loadData();
+</script>
+</body>
+</html>
