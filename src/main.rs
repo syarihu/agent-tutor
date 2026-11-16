@@ -10,7 +10,7 @@ use tutor::{
 
 /// Extract human-authored turns from Claude Code conversation logs and manage review state.
 #[derive(Debug, Parser)]
-#[command(version, about, long_about = None)]
+#[command(version, about, long_about = None, args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -642,6 +642,32 @@ mod tests {
         assert!(parse(&["extract", "--grep", ""]).is_err());
         assert!(parse(&["extract", "--grep", "   "]).is_err());
         assert!(parse(&["extract", "--grep", "ok", "--grep", " "]).is_err());
+    }
+
+    #[test]
+    fn rejects_extract_flags_before_subcommand() {
+        for args in [
+            &["--project", "x", "projects"][..],
+            &["--grep", "x", "projects"][..],
+            &["--no-ledger", "mcp"][..],
+            &["--date", "2026-09-17", "extract"][..],
+        ] {
+            let err = parse(args).err().unwrap_or_else(|| panic!("{args:?}"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_flags_after_subcommand_or_without_one() {
+        let cli = parse(&["--project", "x"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.extract.project.as_deref(), Some("x"));
+        assert!(parse(&["extract", "--project", "x"]).is_ok());
+        assert!(parse(&["projects", "--date", "2026-09-17"]).is_ok());
     }
 
     #[test]
