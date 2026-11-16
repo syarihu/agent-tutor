@@ -16,7 +16,9 @@ Instead of repeating corrections or manually maintaining rules, `tutor` extracts
 # Basic extraction
 tutor                                            # Extract today's human turns (JSONL)
 tutor --date 2026-09-17 --format md              # Markdown output for a specific date
+tutor --since 2026-09-01 --until 2026-09-30      # Extract a date range (inclusive, local dates)
 tutor projects                                   # List projects with unreviewed turns
+tutor projects --since 2026-09-01                # Per-day counts per project, through today
 
 # Interactive Web Review UI
 tutor ui                                         # Launch interactive web review UI in browser
@@ -37,6 +39,13 @@ By default, `--date` is today in the machine's local timezone, `--projects-dir` 
 `~/.claude/projects`, and output is JSONL. Reviewed turns recorded with `approved` or `rejected`
 status in the ledger (`~/.local/state/tutor/ledger.json` by default) are automatically skipped
 from extraction. Pass `--no-ledger` to inspect all candidate turns. Run `tutor --help` for all options.
+
+`--since` / `--until` take inclusive local calendar dates and cannot be combined with `--date`;
+`--until` requires `--since`, and `--since` alone runs through today. A range returns the same turns,
+turn indexes, and ledger keys as running each day separately. With a range of more than one day,
+`tutor projects` also reports per-day counts (`daily_counts` in JSON output). Long ranges can produce
+a lot of extraction output, so check the counts with `tutor projects` first and narrow the extraction
+with `--project`.
 
 ## Installation and Development
 
@@ -77,8 +86,8 @@ Or manually configure your MCP client:
 ```
 
 Available MCP tools:
-- `tutor_projects`: List repositories/projects with unreviewed turns for a local date
-- `tutor_extract`: Extract candidate turns and context for a local date
+- `tutor_projects`: List repositories/projects with unreviewed turns for a local date or an inclusive `since`/`until` range (per-day counts for ranges)
+- `tutor_extract`: Extract candidate turns and context for a local date or an inclusive `since`/`until` range
 - `tutor_review_ui`: Launch interactive Web Review UI in browser and return finalized decisions
 - `tutor_mark`: Record review decisions (approved, rejected, deferred) into the ledger
 - `tutor_destinations`: Get the canonical destinations table and triaging guidelines
@@ -124,8 +133,8 @@ targets a `/memory/` path or a path ending in `CLAUDE.md` or `AGENTS.md`.
 The authoritative signal for a genuinely human-originated transcript record is
 `origin.kind == "human"`. This excludes injected system reminders, attachment events, tool results,
 and subagent prompts without brittle inspection of their text. Candidate turns must additionally be
-non-sidechain string messages whose UTC timestamp falls on the requested date after conversion to
-the machine's local timezone.
+non-sidechain string messages whose UTC timestamp falls on the requested date (or within the
+requested date range) after conversion to the machine's local timezone.
 
 Some launchers enter fixed prompts through the same terminal path as a person, so those prompts also
 carry `origin.kind == "human"`. `tutor` therefore performs a second pass: identical text seen in at

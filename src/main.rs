@@ -3,7 +3,10 @@ use std::path::PathBuf;
 
 use chrono::{Local, NaiveDate};
 use clap::{Args, Parser, Subcommand};
-use tutor::{Config, JudgmentStatus, Ledger, LedgerEntry, OutputFormat, extract, write_output};
+use tutor::{
+    Config, DateRange, JudgmentStatus, Ledger, LedgerEntry, OutputFormat, extract,
+    resolve_date_range, write_output,
+};
 
 /// Extract human-authored turns from Claude Code conversation logs and manage review state.
 #[derive(Debug, Parser)]
@@ -38,11 +41,32 @@ enum Commands {
     Mcp,
 }
 
+/// Date selection shared by `extract` and `projects`. All dates are local calendar dates.
+#[derive(Debug, Args, Clone)]
+struct DateArgs {
+    /// Single local calendar date (YYYY-MM-DD). Defaults to today when no range is given.
+    #[arg(long, value_name = "YYYY-MM-DD", conflicts_with_all = ["since", "until"])]
+    date: Option<NaiveDate>,
+
+    /// First local calendar date of a range, inclusive (YYYY-MM-DD). Without --until, runs through today.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    since: Option<NaiveDate>,
+
+    /// Last local calendar date of a range, inclusive (YYYY-MM-DD). Requires --since.
+    #[arg(long, value_name = "YYYY-MM-DD", requires = "since")]
+    until: Option<NaiveDate>,
+}
+
+impl DateArgs {
+    fn resolve(&self) -> Result<DateRange, String> {
+        resolve_date_range(self.date, self.since, self.until, Local::now().date_naive())
+    }
+}
+
 #[derive(Debug, Args, Clone)]
 struct ExtractArgs {
-    /// Local calendar date to extract (YYYY-MM-DD). Defaults to today.
-    #[arg(long, value_name = "YYYY-MM-DD")]
-    date: Option<NaiveDate>,
+    #[command(flatten)]
+    dates: DateArgs,
 
     /// Root directory containing Claude Code project transcript files.
     #[arg(long, default_value_os_t = default_projects_dir(), value_name = "PATH")]
@@ -121,9 +145,8 @@ struct LedgerArgs {
 
 #[derive(Debug, Args, Clone)]
 struct ProjectsArgs {
-    /// Local calendar date (YYYY-MM-DD). Defaults to today.
-    #[arg(long, value_name = "YYYY-MM-DD")]
-    date: Option<NaiveDate>,
+    #[command(flatten)]
+    dates: DateArgs,
 
     /// Root directory containing Claude Code project transcript files.
     #[arg(long, default_value_os_t = default_projects_dir(), value_name = "PATH")]
@@ -238,7 +261,7 @@ fn resolve_ledger_path(specified: Option<PathBuf>, no_ledger: bool) -> Option<Pa
 fn handle_extract(args: ExtractArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ledger_path = resolve_ledger_path(args.ledger, args.no_ledger);
     let config = Config {
-        date: args.date.unwrap_or_else(|| Local::now().date_naive()),
+        dates: args.dates.resolve()?,
         projects_dir: args.projects_dir,
         boilerplate_threshold: args.boilerplate_threshold,
         context_chars: args.context_chars,
@@ -259,7 +282,7 @@ fn handle_extract(args: ExtractArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn handle_projects(args: ProjectsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ledger_path = resolve_ledger_path(args.ledger, args.no_ledger);
     let config = Config {
-        date: args.date.unwrap_or_else(|| Local::now().date_naive()),
+        dates: args.dates.resolve()?,
         projects_dir: args.projects_dir,
         boilerplate_threshold: 3,
         context_chars: 600,
@@ -281,7 +304,7 @@ fn handle_projects(args: ProjectsArgs) -> Result<(), Box<dyn std::error::Error>>
         writeln!(
             stdout,
             "No projects with unreviewed turns found for {}.",
-            config.date
+            config.dates
         )?;
     } else {
         writeln!(stdout, "{:<35} {:<6} WORKING DIRECTORY", "PROJECT", "TURNS")?;
@@ -292,6 +315,11 @@ fn handle_projects(args: ProjectsArgs) -> Result<(), Box<dyn std::error::Error>>
                 "{:<35} {:<6} {}",
                 p.project_dir, p.turns_count, p.cwd
             )?;
+            if let Some(daily) = &p.daily_counts {
+                for (day, count) in daily {
+                    writeln!(stdout, "  {day}  {count}")?;
+                }
+            }
         }
     }
     Ok(())
@@ -473,7 +501,7 @@ fn handle_ui(args: UiArgs) -> Result<(), Box<dyn std::error::Error>> {
         serde_json::from_str(&content)?
     } else {
         let config = Config {
-            date: args.date.unwrap_or_else(|| Local::now().date_naive()),
+            dates: DateRange::single(args.date.unwrap_or_else(|| Local::now().date_naive())),
             projects_dir: args.projects_dir,
             boilerplate_threshold: 3,
             context_chars: 600,
@@ -524,5 +552,59 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("tutor: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("tutor").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn accepts_date_or_range() {
+        assert!(parse(&["extract", "--date", "2026-09-17"]).is_ok());
+        assert!(parse(&["extract", "--since", "2026-09-01"]).is_ok());
+        assert!(parse(&["extract", "--since", "2026-09-01", "--until", "2026-09-30"]).is_ok());
+        assert!(parse(&["projects", "--since", "2026-09-01", "--until", "2026-09-30"]).is_ok());
+        assert!(parse(&["--since", "2026-09-01"]).is_ok());
+    }
+
+    #[test]
+    fn rejects_date_combined_with_range() {
+        for command in [&["extract"][..], &["projects"][..], &[][..]] {
+            for extra in [
+                ["--date", "2026-09-17", "--since", "2026-09-01"],
+                ["--date", "2026-09-17", "--until", "2026-09-30"],
+            ] {
+                let args: Vec<&str> = command.iter().copied().chain(extra).collect();
+                assert!(parse(&args).is_err(), "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_until_without_since() {
+        assert!(parse(&["extract", "--until", "2026-09-30"]).is_err());
+        assert!(parse(&["projects", "--until", "2026-09-30"]).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_dates() {
+        assert!(parse(&["extract", "--since", "yesterday"]).is_err());
+    }
+
+    #[test]
+    fn rejects_inverted_range_on_resolve() {
+        let Some(Commands::Extract(args)) =
+            parse(&["extract", "--since", "2026-09-30", "--until", "2026-09-01"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected extract");
+        };
+        assert!(args.dates.resolve().is_err());
     }
 }

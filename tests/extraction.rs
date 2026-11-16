@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::{FixedOffset, NaiveDate};
 use tutor::{
-    Config, JudgmentStatus, Ledger, LedgerEntry, OutputFormat, extract, list_projects, write_output,
+    Config, DateRange, JudgmentStatus, Ledger, LedgerEntry, OutputFormat, extract, list_projects,
+    resolve_date_range, write_output,
 };
 
 fn fixture_root() -> PathBuf {
@@ -12,7 +13,7 @@ fn fixture_root() -> PathBuf {
 
 fn config(projects_dir: PathBuf, offset_seconds: i32) -> Config {
     Config {
-        date: NaiveDate::from_ymd_opt(2026, 9, 17).unwrap(),
+        dates: DateRange::single(NaiveDate::from_ymd_opt(2026, 9, 17).unwrap()),
         projects_dir,
         boilerplate_threshold: 3,
         context_chars: 600,
@@ -353,4 +354,266 @@ fn filters_turns_by_project_name() {
     assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].project_dir, "project-two");
     assert_eq!(turns[0].session, "test-session-2");
+}
+
+fn d(day: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 9, day).unwrap()
+}
+
+fn human_line(session: &str, uuid: &str, timestamp: &str, text: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "uuid": uuid,
+        "parentUuid": null,
+        "sessionId": session,
+        "timestamp": timestamp,
+        "cwd": "/tmp/range",
+        "isSidechain": false,
+        "origin": {"kind": "human"},
+        "message": {"content": text}
+    })
+    .to_string()
+}
+
+fn write_session(root: &Path, project: &str, file: &str, lines: &[(&str, &str, &str)]) {
+    let dir = root.join(project);
+    fs::create_dir_all(&dir).unwrap();
+    let body = lines
+        .iter()
+        .enumerate()
+        .map(|(index, (session, timestamp, text))| {
+            human_line(session, &format!("{session}-{index}"), timestamp, text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(dir.join(file), body).unwrap();
+}
+
+/// Transcripts spread over 2026-09-10..=12 (UTC offset 0). The prompt "shared" is sent by four
+/// distinct sessions overall but by at most two on any single day, and "BOILER" by three on the 12th.
+fn range_fixture() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_session(
+        root,
+        "proj-a",
+        "s1.jsonl",
+        &[
+            ("s1", "2026-09-10T01:00:00Z", "alpha1"),
+            ("s1", "2026-09-10T02:00:00Z", "alpha2"),
+            ("s1", "2026-09-11T03:00:00Z", "beta1"),
+            ("s1", "2026-09-13T03:00:00Z", "out of range"),
+        ],
+    );
+    write_session(
+        root,
+        "proj-a",
+        "s2.jsonl",
+        &[
+            ("s2", "2026-09-10T04:00:00Z", "shared"),
+            ("s2", "2026-09-11T04:00:00Z", "x2"),
+        ],
+    );
+    write_session(
+        root,
+        "proj-b",
+        "s3.jsonl",
+        &[
+            ("s3", "2026-09-10T05:00:00Z", "shared"),
+            ("s3", "2026-09-12T05:00:00Z", "BOILER"),
+            ("s3", "2026-09-12T06:00:00Z", "shared"),
+        ],
+    );
+    write_session(
+        root,
+        "proj-b",
+        "s4.jsonl",
+        &[
+            ("s4", "2026-09-11T05:00:00Z", "shared"),
+            ("s4", "2026-09-12T05:00:00Z", "BOILER"),
+            ("s4", "2026-09-12T07:00:00Z", "y"),
+        ],
+    );
+    write_session(
+        root,
+        "proj-b",
+        "s5.jsonl",
+        &[("s5", "2026-09-12T05:00:00Z", "BOILER")],
+    );
+    temp
+}
+
+fn range_config(root: &Path, dates: DateRange) -> Config {
+    let mut cfg = config(root.to_owned(), 0);
+    cfg.dates = dates;
+    cfg
+}
+
+fn keys(turns: &[tutor::OutputTurn]) -> Vec<(String, usize, String, bool)> {
+    turns
+        .iter()
+        .map(|turn| {
+            (
+                turn.session.clone(),
+                turn.turn_index,
+                turn.human.clone(),
+                turn.already_captured,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn range_equals_union_of_single_days() {
+    let temp = range_fixture();
+    let mut warnings = Vec::new();
+    let ranged = extract(
+        &range_config(temp.path(), DateRange::new(d(10), d(12)).unwrap()),
+        &mut warnings,
+    )
+    .unwrap();
+
+    let mut union = Vec::new();
+    for day in 10..=12 {
+        let single = extract(
+            &range_config(temp.path(), DateRange::single(d(day))),
+            &mut warnings,
+        )
+        .unwrap();
+        union.extend(keys(&single));
+    }
+    let mut ranged_keys = keys(&ranged);
+    union.sort();
+    ranged_keys.sort();
+    assert_eq!(ranged_keys, union);
+    assert_eq!(ranged.len(), 9);
+
+    let s1: Vec<_> = ranged
+        .iter()
+        .filter(|turn| turn.session == "s1")
+        .map(|turn| (turn.human.as_str(), turn.turn_index))
+        .collect();
+    assert_eq!(s1, [("alpha1", 1), ("alpha2", 2), ("beta1", 1)]);
+    assert!(ranged.iter().all(|turn| turn.human != "out of range"));
+}
+
+#[test]
+fn single_day_range_matches_date_result() {
+    let temp = range_fixture();
+    let mut warnings = Vec::new();
+    let cfg = range_config(temp.path(), DateRange::new(d(10), d(10)).unwrap());
+    assert!(cfg.dates.is_single_day());
+    let turns = extract(&cfg, &mut warnings).unwrap();
+    assert_eq!(
+        keys(&turns),
+        [
+            ("s1".to_owned(), 1, "alpha1".to_owned(), false),
+            ("s1".to_owned(), 2, "alpha2".to_owned(), false),
+            ("s2".to_owned(), 1, "shared".to_owned(), false),
+            ("s3".to_owned(), 1, "shared".to_owned(), false),
+        ]
+    );
+}
+
+#[test]
+fn boilerplate_is_counted_per_day_in_a_range() {
+    let temp = range_fixture();
+    let mut warnings = Vec::new();
+    let turns = extract(
+        &range_config(temp.path(), DateRange::new(d(10), d(12)).unwrap()),
+        &mut warnings,
+    )
+    .unwrap();
+    let warnings = String::from_utf8(warnings).unwrap();
+
+    assert_eq!(turns.iter().filter(|t| t.human == "shared").count(), 4);
+    assert!(turns.iter().all(|turn| turn.human != "BOILER"));
+    assert!(warnings.contains("excluded boilerplate seen in 3 distinct sessions on 2026-09-12"));
+
+    // s3 and s4 lose their BOILER turn, so numbering restarts at 1 on that day.
+    let s4: Vec<_> = turns
+        .iter()
+        .filter(|turn| turn.session == "s4")
+        .map(|turn| (turn.human.as_str(), turn.turn_index))
+        .collect();
+    assert_eq!(s4, [("shared", 1), ("y", 1)]);
+}
+
+#[test]
+fn single_day_boilerplate_warning_has_no_date() {
+    let temp = range_fixture();
+    let mut warnings = Vec::new();
+    extract(
+        &range_config(temp.path(), DateRange::single(d(12))),
+        &mut warnings,
+    )
+    .unwrap();
+    let warnings = String::from_utf8(warnings).unwrap();
+    assert!(warnings.contains("excluded boilerplate seen in 3 distinct sessions: \"BOILER\""));
+}
+
+#[test]
+fn list_projects_reports_daily_counts_only_for_multi_day_ranges() {
+    let temp = range_fixture();
+    let mut warnings = Vec::new();
+
+    let ranged = list_projects(
+        &range_config(temp.path(), DateRange::new(d(10), d(12)).unwrap()),
+        &mut warnings,
+    )
+    .unwrap();
+    assert_eq!(ranged.len(), 2);
+    let proj_a = ranged.iter().find(|p| p.project_dir == "proj-a").unwrap();
+    assert_eq!(proj_a.turns_count, 5);
+    let daily = proj_a.daily_counts.as_ref().unwrap();
+    assert_eq!(daily.get("2026-09-10"), Some(&3));
+    assert_eq!(daily.get("2026-09-11"), Some(&2));
+    assert_eq!(daily.get("2026-09-12"), None);
+    let proj_b = ranged.iter().find(|p| p.project_dir == "proj-b").unwrap();
+    assert_eq!(proj_b.turns_count, 4);
+
+    let single = list_projects(
+        &range_config(temp.path(), DateRange::single(d(10))),
+        &mut warnings,
+    )
+    .unwrap();
+    assert!(single.iter().all(|p| p.daily_counts.is_none()));
+    let json = serde_json::to_string(&single).unwrap();
+    assert!(!json.contains("daily_counts"));
+}
+
+#[test]
+fn resolves_date_ranges() {
+    let today = d(20);
+    assert_eq!(
+        resolve_date_range(None, None, None, today).unwrap(),
+        DateRange::single(today)
+    );
+    assert_eq!(
+        resolve_date_range(Some(d(5)), None, None, today).unwrap(),
+        DateRange::single(d(5))
+    );
+    assert_eq!(
+        resolve_date_range(None, Some(d(5)), None, today).unwrap(),
+        DateRange::new(d(5), today).unwrap()
+    );
+    assert_eq!(
+        resolve_date_range(None, Some(d(5)), Some(d(7)), today).unwrap(),
+        DateRange::new(d(5), d(7)).unwrap()
+    );
+    assert!(resolve_date_range(Some(d(5)), Some(d(5)), None, today).is_err());
+    assert!(resolve_date_range(Some(d(5)), None, Some(d(5)), today).is_err());
+    assert!(resolve_date_range(None, None, Some(d(5)), today).is_err());
+    assert!(resolve_date_range(None, Some(d(7)), Some(d(5)), today).is_err());
+    assert!(resolve_date_range(None, Some(d(25)), None, today).is_err());
+}
+
+#[test]
+fn date_range_displays_single_day_and_range() {
+    assert_eq!(DateRange::single(d(10)).to_string(), "2026-09-10");
+    assert_eq!(
+        DateRange::new(d(1), d(30)).unwrap().to_string(),
+        "2026-09-01..2026-09-30"
+    );
+    assert!(DateRange::new(d(2), d(1)).is_err());
 }
