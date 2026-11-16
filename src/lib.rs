@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -31,6 +31,11 @@ pub enum JudgmentStatus {
 pub struct LedgerEntry {
     pub session: String,
     pub turn_index: usize,
+    /// The turn's local date ("YYYY-MM-DD"). `turn_index` restarts every local day, so the date
+    /// is part of the key. Absent only on entries written before the date was recorded. Kept as
+    /// text so one malformed value cannot make the whole ledger unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
     pub status: JudgmentStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
@@ -46,8 +51,48 @@ pub struct Ledger {
     pub entries: HashMap<String, LedgerEntry>,
 }
 
+/// Parse a ledger date. Only the canonical zero-padded `YYYY-MM-DD` form is accepted so that one
+/// turn always maps to one key.
+pub fn parse_ledger_date(text: &str) -> Result<NaiveDate, String> {
+    let date = NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .map_err(|err| format!("invalid date '{text}': {err}"))?;
+    if date.to_string() != text {
+        return Err(format!("invalid date '{text}': expected YYYY-MM-DD"));
+    }
+    Ok(date)
+}
+
+/// Check that every batch entry carries a valid `date`, naming the offending entry indexes.
+pub fn validate_batch_entries(entries: &[LedgerEntry]) -> Result<(), String> {
+    let bad: Vec<String> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry
+                .date
+                .as_deref()
+                .is_none_or(|date| parse_ledger_date(date).is_err())
+        })
+        .map(|(index, _)| index.to_string())
+        .collect();
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "batch entries must have a valid \"date\" (YYYY-MM-DD); missing or invalid in entry index(es): {}",
+            bad.join(", ")
+        ))
+    }
+}
+
 impl Ledger {
-    pub fn entry_key(session: &str, turn_index: usize) -> String {
+    /// Key for an entry: `session:YYYY-MM-DD:turn_index`.
+    pub fn entry_key(session: &str, date: &str, turn_index: usize) -> String {
+        format!("{session}:{date}:{turn_index}")
+    }
+
+    /// Key used before the date was added: `session:turn_index`.
+    pub fn legacy_entry_key(session: &str, turn_index: usize) -> String {
         format!("{session}:{turn_index}")
     }
 
@@ -70,9 +115,17 @@ impl Ledger {
         Ok(())
     }
 
-    pub fn is_reviewed(&self, session: &str, turn_index: usize) -> bool {
-        let key = Self::entry_key(session, turn_index);
-        self.entries.get(&key).is_some_and(|entry| {
+    /// Whether the turn is settled. An entry under the dated key decides on its own, even if a
+    /// legacy entry says otherwise; the legacy key is consulted only when no dated entry exists.
+    pub fn is_reviewed(&self, session: &str, date: &str, turn_index: usize) -> bool {
+        let entry = self
+            .entries
+            .get(&Self::entry_key(session, date, turn_index))
+            .or_else(|| {
+                self.entries
+                    .get(&Self::legacy_entry_key(session, turn_index))
+            });
+        entry.is_some_and(|entry| {
             matches!(
                 entry.status,
                 JudgmentStatus::Approved | JudgmentStatus::Rejected
@@ -80,8 +133,13 @@ impl Ledger {
         })
     }
 
+    /// Store an entry under its dated key. An entry without a date goes under the legacy key so
+    /// old data round-trips unchanged; no write path creates new date-less entries.
     pub fn record(&mut self, entry: LedgerEntry) {
-        let key = Self::entry_key(&entry.session, entry.turn_index);
+        let key = match &entry.date {
+            Some(date) => Self::entry_key(&entry.session, date, entry.turn_index),
+            None => Self::legacy_entry_key(&entry.session, entry.turn_index),
+        };
         self.entries.insert(key, entry);
     }
 }
@@ -201,6 +259,8 @@ pub struct OutputTurn {
     pub project_dir: String,
     pub cwd: String,
     pub turn_index: usize,
+    /// Local date of the turn; `turn_index` is numbered per local date.
+    pub date: String,
     pub timestamp_local: String,
     pub human: String,
     pub prev_assistant: String,
@@ -303,7 +363,11 @@ pub fn extract(config: &Config, warnings: &mut impl Write) -> io::Result<Vec<Out
             .collect();
         for (turn_index, candidate) in matching {
             if let Some(ledger) = &ledger
-                && ledger.is_reviewed(&candidate.session, turn_index)
+                && ledger.is_reviewed(
+                    &candidate.session,
+                    &candidate.local_date.to_string(),
+                    turn_index,
+                )
             {
                 continue;
             }
@@ -323,6 +387,7 @@ pub fn extract(config: &Config, warnings: &mut impl Write) -> io::Result<Vec<Out
                 project_dir: file.project_dir.clone(),
                 cwd: candidate.cwd.clone(),
                 turn_index,
+                date: candidate.local_date.to_string(),
                 timestamp_local: candidate.timestamp_local.clone(),
                 human: candidate.human.clone(),
                 prev_assistant,
@@ -352,7 +417,11 @@ pub fn list_projects(config: &Config, warnings: &mut impl Write) -> io::Result<V
     for file in files {
         for (turn_index, candidate) in file.numbered_candidates(&boilerplate) {
             if let Some(ledger) = &ledger
-                && ledger.is_reviewed(&candidate.session, turn_index)
+                && ledger.is_reviewed(
+                    &candidate.session,
+                    &candidate.local_date.to_string(),
+                    turn_index,
+                )
             {
                 continue;
             }
@@ -388,6 +457,159 @@ pub fn list_projects(config: &Config, warnings: &mut impl Write) -> io::Result<V
     });
 
     Ok(results)
+}
+
+/// Outcome of `migrate_ledger`. Each list holds ledger keys as they were before migration.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct MigrationReport {
+    pub migrated: Vec<String>,
+    /// Legacy entries whose turn existed on several dates when it was marked; left as they are.
+    pub ambiguous: Vec<String>,
+    /// Legacy entries with no matching turn in the transcripts; left as they are.
+    pub not_found: Vec<String>,
+    /// Dated-key entries that lacked a `date` field (re-saved by an older binary).
+    pub repaired: Vec<String>,
+    /// Copy of the ledger taken before it was rewritten. `None` when nothing changed.
+    pub backup: Option<PathBuf>,
+}
+
+/// A numbered turn's local date and timestamp (unparsable timestamps are `None`).
+type TurnTime = (NaiveDate, Option<DateTime<FixedOffset>>);
+
+/// Split a dated key into `(date, turn_index)` if it matches `session:YYYY-MM-DD:turn_index`.
+fn parse_dated_key(key: &str, session: &str) -> Option<(String, usize)> {
+    let rest = key.strip_prefix(session)?.strip_prefix(':')?;
+    let (date, turn) = rest.split_once(':')?;
+    parse_ledger_date(date).ok()?;
+    Some((date.to_owned(), turn.parse().ok()?))
+}
+
+/// Give legacy `session:turn_index` entries a date and move them to the dated key.
+///
+/// Turns are renumbered from the transcripts under `config` (projects dir, boilerplate threshold,
+/// timezone), over all dates, so numbering matches what `extract` used when the entry was made.
+/// `config.dates` and `config.ledger_path` are ignored. A turn that was marked before it was
+/// written cannot be the one that was marked, so candidates later than the entry's `timestamp`
+/// are dropped; if exactly one date is left the entry moves there. Entries that stay ambiguous or
+/// unmatched are kept and still work through the legacy fallback in `Ledger::is_reviewed`.
+/// The ledger is backed up before it is rewritten, and not touched when nothing changes.
+pub fn migrate_ledger(
+    config: &Config,
+    ledger_path: &Path,
+    warnings: &mut impl Write,
+) -> io::Result<MigrationReport> {
+    let mut ledger = Ledger::load(ledger_path)?;
+    let mut report = MigrationReport::default();
+
+    let mut config = config.clone();
+    config.dates = DateRange::new(NaiveDate::MIN, NaiveDate::MAX).map_err(io::Error::other)?;
+    let Loaded { files, boilerplate } = load_files(&config, warnings)?;
+
+    // (session, turn_index) -> candidates' (local date, parsed timestamp)
+    let mut turns: HashMap<(&str, usize), Vec<TurnTime>> = HashMap::new();
+    for file in &files {
+        for (turn_index, candidate) in file.numbered_candidates(&boilerplate) {
+            let at = DateTime::parse_from_rfc3339(&candidate.timestamp_local).ok();
+            turns
+                .entry((candidate.session.as_str(), turn_index))
+                .or_default()
+                .push((candidate.local_date, at));
+        }
+    }
+
+    let mut keys: Vec<String> = ledger.entries.keys().cloned().collect();
+    keys.sort();
+    for key in keys {
+        let Some(entry) = ledger.entries.get(&key) else {
+            continue;
+        };
+        if entry.date.is_some() {
+            continue;
+        }
+        let (session, entry_turn, entry_timestamp) = (
+            entry.session.clone(),
+            entry.turn_index,
+            entry.timestamp.clone(),
+        );
+        if let Some((date, turn_index)) = parse_dated_key(&key, &session)
+            && turn_index == entry_turn
+        {
+            if let Some(entry) = ledger.entries.get_mut(&key) {
+                entry.date = Some(date);
+            }
+            report.repaired.push(key);
+            continue;
+        }
+        if key != Ledger::legacy_entry_key(&session, entry_turn) {
+            continue;
+        }
+
+        let marked_at = entry_timestamp
+            .as_deref()
+            .and_then(|text| DateTime::parse_from_rfc3339(text).ok());
+        let dates: BTreeSet<NaiveDate> = turns
+            .get(&(session.as_str(), entry_turn))
+            .into_iter()
+            .flatten()
+            .filter(|(_, at)| match (at, marked_at) {
+                (Some(at), Some(marked_at)) => *at <= marked_at,
+                _ => true,
+            })
+            .map(|(date, _)| *date)
+            .collect();
+        let mut dates = dates.into_iter();
+        match (dates.next(), dates.next()) {
+            (None, _) => report.not_found.push(key),
+            (Some(_), Some(_)) => report.ambiguous.push(key),
+            (Some(date), None) => {
+                let date = date.to_string();
+                let Some(mut entry) = ledger.entries.remove(&key) else {
+                    continue;
+                };
+                let new_key = Ledger::entry_key(&entry.session, &date, entry.turn_index);
+                // A judgment already made under the dated key is newer information.
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    ledger.entries.entry(new_key)
+                {
+                    entry.date = Some(date);
+                    slot.insert(entry);
+                }
+                report.migrated.push(key);
+            }
+        }
+    }
+
+    if !report.migrated.is_empty() || !report.repaired.is_empty() {
+        report.backup = Some(backup_file(ledger_path)?);
+        ledger.save(ledger_path)?;
+    }
+    Ok(report)
+}
+
+/// Copy `path` to `<path>.bak-<timestamp>`, never overwriting an existing backup.
+fn backup_file(path: &Path) -> io::Result<PathBuf> {
+    let stamp = Local::now().format("%Y%m%d%H%M%S");
+    for attempt in 0.. {
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".bak-{stamp}"));
+        if attempt > 0 {
+            name.push(format!("-{attempt}"));
+        }
+        let backup = PathBuf::from(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(mut target) => {
+                io::copy(&mut File::open(path)?, &mut target)?;
+                return Ok(backup);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the attempt counter is unbounded")
 }
 
 /// Parsed transcripts plus the prompts treated as boilerplate on each local date.

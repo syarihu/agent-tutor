@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Config, DateRange, JudgmentStatus, Ledger, LedgerEntry, OutputFormat, extract,
-    resolve_date_range, write_output,
+    parse_ledger_date, resolve_date_range, write_output,
 };
 
 #[derive(Debug, Deserialize)]
@@ -180,7 +180,7 @@ fn handle_request(
                             "grep": {
                                 "type": ["string", "array"],
                                 "items": {"type": "string"},
-                                "description": "Optional filter on the human turn's text: a literal, case-insensitive substring (not a regex), or an array of them where a turn matching any one is kept (OR). Only the human text is searched, not the assistant context. Values must not be empty or whitespace-only. turn_index stays the same as in an unfiltered run."
+                                "description": "Optional filter on the human turn's text: a literal, case-insensitive substring (not a regex), or an array of them where a turn matching any one is kept (OR). Only the human text is searched, not the assistant context. Values must not be empty or whitespace-only. turn_index stays the same as in an unfiltered run. Each turn carries its local `date`; turn_index is numbered per date, so pass both to tutor_mark."
                             },
                             "no_ledger": {
                                 "type": "boolean",
@@ -206,7 +206,11 @@ fn handle_request(
                             },
                             "turn_index": {
                                 "type": "integer",
-                                "description": "1-based turn index from the extracted turn."
+                                "description": "1-based turn index from the extracted turn. It restarts every local day, so it is only unique together with date."
+                            },
+                            "date": {
+                                "type": "string",
+                                "description": "Local date (YYYY-MM-DD) of the turn, from the extracted turn's `date`."
                             },
                             "status": {
                                 "type": "string",
@@ -222,7 +226,7 @@ fn handle_request(
                                 "description": "Reason for the judgment or convention."
                             }
                         },
-                        "required": ["session", "turn_index", "status"]
+                        "required": ["session", "turn_index", "date", "status"]
                     }
                 },
                 {
@@ -239,6 +243,7 @@ fn handle_request(
                                     "properties": {
                                         "session": { "type": "string" },
                                         "turn_index": { "type": "integer" },
+                                        "date": { "type": "string", "description": "Local date (YYYY-MM-DD) from the extracted turn's `date`. turn_index is only unique per date." },
                                         "human": { "type": "string" },
                                         "prev_assistant": { "type": "string" },
                                         "status": { "type": "string", "enum": ["approved", "rejected", "deferred"] },
@@ -249,7 +254,7 @@ fn handle_request(
                                         "cwd": { "type": "string" },
                                         "file_path": { "type": "string" }
                                     },
-                                    "required": ["session", "turn_index", "human"]
+                                    "required": ["session", "turn_index", "date", "human"]
                                 }
                             },
                             "port": {
@@ -605,6 +610,11 @@ fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value
                 .and_then(Value::as_u64)
                 .ok_or_else(|| "Missing 'turn_index' argument".to_owned())?
                 as usize;
+            let date = args
+                .get("date")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Missing 'date' argument (YYYY-MM-DD)".to_owned())?;
+            parse_ledger_date(date).map_err(|err| format!("Invalid 'date' argument: {err}"))?;
             let status_str = args
                 .get("status")
                 .and_then(Value::as_str)
@@ -637,13 +647,14 @@ fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value
             let entry = LedgerEntry {
                 session: session.to_owned(),
                 turn_index,
+                date: Some(date.to_owned()),
                 status,
                 destination,
                 reason,
                 timestamp: Some(Local::now().to_rfc3339()),
             };
 
-            let key = Ledger::entry_key(&entry.session, entry.turn_index);
+            let key = Ledger::entry_key(&entry.session, date, entry.turn_index);
             ledger.record(entry);
             ledger
                 .save(&ledger_path)
@@ -701,6 +712,14 @@ fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value
                 .ok_or_else(|| "Missing 'items' argument".to_owned())?;
             let items: Vec<crate::ui::ReviewItem> = serde_json::from_value(items_val.clone())
                 .map_err(|err| format!("Invalid 'items' array: {err}"))?;
+            // Checked here too so `no_ledger` calls get the same early, clear error.
+            let undated = crate::ui::undated_items(&items);
+            if !undated.is_empty() {
+                return Err(format!(
+                    "Items need a valid 'date' (YYYY-MM-DD, from tutor_extract) or a 'timestamp_local'; missing or invalid for: {}",
+                    undated.join(", ")
+                ));
+            }
             let port = args.get("port").and_then(Value::as_u64).map(|p| p as u16);
             let no_ledger = args
                 .get("no_ledger")
@@ -787,13 +806,13 @@ pub fn generate_review_prompt(date_str: &str, lang: &str) -> String {
             Follow this structured workflow:\n\
             1. Call `tutor_projects` with date=\"{date_str}\" to list repositories with unreviewed turns, and ask the user which project to triage (or triage all).\n\
             2. Call `tutor_destinations` to inspect available destination layers (conventions, documentation, issues/tasks, knowledge) for this environment.\n\
-            3. Call `tutor_extract` for the selected project to fetch unreviewed human turns.\n\
+            3. Call `tutor_extract` for the selected project to fetch unreviewed human turns. Each turn has a `date` (local date) and a `turn_index` that is numbered per date.\n\
             4. If no turns are returned, notify that all feedback has been reviewed and finish.\n\
             5. For each turn, analyze the feedback and choose the best destination:\n\
                - For conventions/docs: produce a unified diff draft\n\
                - For issue/task management (e.g. GitHub Issues, Linear): produce an issue title and markdown body draft\n\
                - For knowledge tools (e.g. lk, Notion): produce a structured knowledge entry draft\n\
-            6. Call `tutor_review_ui` with the array of items to launch the Web Review UI in the browser for user confirmation.\n\
+            6. Call `tutor_review_ui` with the array of items to launch the Web Review UI in the browser for user confirmation. Copy `session`, `turn_index` and `date` from the extracted turn into each item unchanged.\n\
             7. Once the user submits in the UI, apply all approved changes according to their destination type:\n\
                - Files: edit or append to files\n\
                - GitHub Issues: run `gh issue create --title ... --body ...`\n\
@@ -806,13 +825,13 @@ pub fn generate_review_prompt(date_str: &str, lang: &str) -> String {
             以下の手順に沿って自律的に実行してください：\n\
             1. `tutor_projects`（date: \"{date_str}\"）を呼び出し、会話ログが存在するリポジトリ・プロジェクト一覧と未レビュー件数をユーザーに提示して、どのリポジトリを対象にするか確認する（全件も可）。\n\
             2. `tutor_destinations` を呼び出して、この環境で利用可能な宛先一覧（規約・ドキュメント・GitHub Issue / Linear などのタスク管理・ナレッジ）を確認する。\n\
-            3. 選択されたプロジェクトの未判定ターンを `tutor_extract`（project: ..., date: \"{date_str}\"）で取得する。\n\
+            3. 選択されたプロジェクトの未判定ターンを `tutor_extract`（project: ..., date: \"{date_str}\"）で取得する。各ターンには `date`（ローカル日付）と、日付ごとに採番された `turn_index` が含まれる。\n\
             4. 取得結果が0件の場合は、「対象リポジトリの未判定な指摘はありませんでした」と報告して終了する。\n\
             5. 各指摘について最適な宛先（規約、docs、GitHub Issue、Linear、ナレッジ等）を選び、提案宛先、理由、ドラフトを生成する：\n\
                - 規約・ドキュメントの場合: 具体的な【適用差分ドラフト（diff）】\n\
                - GitHub Issue / Linear などの場合: 【起票ドラフト（タイトル・本文）】\n\
                - ナレッジの場合: 【知見ドラフト（タイトル・内容）】\n\
-            6. 生成したアイテム配列を渡して `tutor_review_ui` を呼び出し、ブラウザで Web レビュー UI を起動する。\n\
+            6. 生成したアイテム配列を渡して `tutor_review_ui` を呼び出し、ブラウザで Web レビュー UI を起動する。各アイテムの `session`・`turn_index`・`date` は、抽出されたターンの値をそのまま渡す。\n\
             7. ユーザーがブラウザで確定（Submit）したら、返却された結果のうち承認（approved）されたものを各宛先に応じた方法で反映する（台帳は Web UI 側で自動記録済み）：\n\
                - ファイル宛先: ファイルに書き込み・編集\n\
                - GitHub Issue: `gh issue create --title ... --body ...` を実行して起票\n\

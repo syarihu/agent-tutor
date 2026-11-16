@@ -32,7 +32,8 @@ tutor ui --project my-project                    # 特定プロジェクトを�
 tutor destinations                               # 自動検出された反映先一覧を確認
 tutor destinations --reset                       # 環境を再スキャンして宛先設定を再生成
 tutor ledger                                     # 判定済み台帳を確認
-tutor mark --session <SESSION_ID> --turn 1 --status approved --destination project_claude
+tutor ledger --migrate                           # 古い版が書いた台帳エントリーに日付を付与
+tutor mark --session <SESSION_ID> --turn 1 --date 2026-09-17 --status approved --destination project_claude
 
 # MCP 設定とサーバー起動
 tutor install-mcp                                # ~/.claude.json に MCP サーバー設定を自動登録
@@ -41,9 +42,21 @@ tutor mcp                                        # MCP stdio サーバーとし�
 
 デフォルトでは、`--date` はローカルタイムゾーンの今日、`--projects-dir` は `~/.claude/projects`、出力形式は JSONL です。台帳（デフォルトでは `~/.local/state/tutor/ledger.json`）に `approved` または `rejected` として記録されたレビュー済みターンは、次回以降の抽出から自動的に除外されます。未判定ターンをすべて確認したい場合は `--no-ledger` を指定してください。全オプションは `tutor --help` で確認できます。
 
-`--since` / `--until` は両端を含むローカル日付で、`--date` とは併用できません。`--until` には `--since` が必須で、`--since` だけを指定すると今日までが対象です。期間指定の結果は、各日を個別に実行した場合と同じターン・ターン番号・台帳キーになります。2日以上の期間を指定した `tutor projects` は、プロジェクトごとの日別件数も返します（JSON 出力では `daily_counts`）。期間が長いと抽出結果が大きくなるため、`tutor projects` で件数を確認してから `--project` で絞り込んで抽出してください。
+`--since` / `--until` は両端を含むローカル日付で、`--date` とは併用できません。`--until` には `--since` が必須で、`--since` だけを指定すると今日までが対象です。期間指定の結果は、各日を個別に実行した場合と同じターン・ターン番号になります。2日以上の期間を指定した `tutor projects` は、プロジェクトごとの日別件数も返します（JSON 出力では `daily_counts`）。期間が長いと抽出結果が大きくなるため、`tutor projects` で件数を確認してから `--project` で絞り込んで抽出してください。
 
-`--grep <TEXT>` は、人間の発言に TEXT を含むターンだけに絞り込みます。正規表現ではなく、大文字小文字を区別しない部分文字列の一致で、直前のアシスタントの文脈は検索対象になりません。複数回指定するといずれかに一致したターンが対象です（OR）。絞り込みはターン番号を振ったあとに行うため、一致したターンのターン番号と台帳キーは絞り込まない場合と同じです。`tutor projects` には `--grep` オプションがないため、件数は絞り込まれず、`--grep` で除外されるターンも含まれます。
+`--grep <TEXT>` は、人間の発言に TEXT を含むターンだけに絞り込みます。正規表現ではなく、大文字小文字を区別しない部分文字列の一致で、直前のアシスタントの文脈は検索対象になりません。複数回指定するといずれかに一致したターンが対象です（OR）。絞り込みはターン番号を振ったあとに行うため、一致したターンのターン番号は絞り込まない場合と同じです。`tutor projects` には `--grep` オプションがないため、件数は絞り込まれず、`--grep` で除外されるターンも含まれます。
+
+## 台帳キー (Ledger keys)
+
+`turn_index` はローカル日付が変わるたびに 1 から振り直されるため、日をまたぐセッションには各日に 1 番目のターンがあります。そこで台帳のキーは `session:YYYY-MM-DD:turn_index` とし、抽出される各ターンにはローカル日付の `date` が付きます。`tutor mark` には `--date` が必要です（バッチの各エントリーと MCP の `tutor_mark` にも `date` が必要）。値は抽出されたターンの `date` を使います。`session:turn_index` 形式の古いエントリーもそのまま読めます。日付付きエントリーが approved / rejected ならそのターンを除外し、日付付きエントリーが無いときだけ古い形式のエントリーで判定します。日付付きエントリーは常に古い形式より優先されます。
+
+`tutor ledger --migrate [--ledger PATH] [--projects-dir PATH] [--boilerplate-threshold N]` は、古い形式のエントリーに日付を付与します。`extract` と同じ方法でトランスクリプトのターン番号を振り直し、各エントリーが指すターンを特定して日付付きキーへ移します。`date` フィールドが失われたエントリーはキーから補完します。実行前に台帳を `<ledger>.bak-<timestamp>` へコピーし、変更が無ければ何も書き込みません。移行・曖昧・見つからず・補完の件数は stderr に出ます。制限は次のとおりです。
+
+- 日をまたぐセッションで、記録時（`timestamp` で判定）にすでに両日にターン N があったエントリーは古い形式のまま残り、両日のターン N を除外し続けます。
+- トランスクリプトが削除されたエントリーは古い形式のまま残ります。
+- ターン番号は現在のトランスクリプトと現在のタイムゾーンから再計算するため、ファイルの削除やタイムゾーンの変更があると日付を取り違えることがあります。`--boilerplate-threshold` は `extract` で使った値に合わせてください。
+
+古い版の `tutor` は日付付きキーを認識せず、そのターンを未レビューとして扱います。
 
 ## インストールと開発 (Installation)
 
@@ -117,7 +130,7 @@ tutor install-mcp
 デフォルトの JSONL 出力では、選択されたターンごとに1つの JSON オブジェクトが出力されます：
 
 ```json
-{"session":"session-id","project_dir":"-Users-example-project","cwd":"/Users/example/project","turn_index":1,"timestamp_local":"2026-09-17T11:04:07+09:00","human":"please fix this","prev_assistant":"What should I change?","prev_tools":[],"already_captured":false}
+{"session":"session-id","project_dir":"-Users-example-project","cwd":"/Users/example/project","turn_index":1,"date":"2026-09-17","timestamp_local":"2026-09-17T11:04:07+09:00","human":"please fix this","prev_assistant":"What should I change?","prev_tools":[],"already_captured":false}
 ```
 
 `--format md` では、セッションごとにグループ化された Markdown 形式で出力されます。`prev_assistant` は Unicode 文字数で適宜切り詰められます。Bash 呼び出しの場合、`prev_tools` には説明文（あれば）またはコマンドラインの先頭が含まれます（最大60文字）。`already_captured` は、次の人間の発言までに `/memory/` パスまたは末尾が `CLAUDE.md` や `AGENTS.md` のファイルを対象とした `Write` / `Edit` が行われていた場合に `true` になります。
