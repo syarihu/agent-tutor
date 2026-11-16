@@ -22,6 +22,7 @@ fn config(projects_dir: PathBuf, offset_seconds: i32) -> Config {
         ledger_path: None,
         project_filter: None,
         cwd_filter: None,
+        human_filter: Vec::new(),
     }
 }
 
@@ -616,4 +617,241 @@ fn date_range_displays_single_day_and_range() {
         "2026-09-01..2026-09-30"
     );
     assert!(DateRange::new(d(2), d(1)).is_err());
+}
+
+fn assistant_line(
+    session: &str,
+    uuid: &str,
+    parent: Option<&str>,
+    timestamp: &str,
+    text: &str,
+) -> String {
+    serde_json::json!({
+        "type": "assistant",
+        "uuid": uuid,
+        "parentUuid": parent,
+        "sessionId": session,
+        "timestamp": timestamp,
+        "cwd": "/tmp/grep",
+        "isSidechain": false,
+        "message": {"content": [{"type": "text", "text": text}]}
+    })
+    .to_string()
+}
+
+fn grep_human_line(
+    session: &str,
+    uuid: &str,
+    parent: Option<&str>,
+    timestamp: &str,
+    text: &str,
+) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&human_line(session, uuid, timestamp, text)).unwrap();
+    value["parentUuid"] = serde_json::json!(parent);
+    value["cwd"] = serde_json::json!("/tmp/grep");
+    value.to_string()
+}
+
+/// Two projects; each human turn follows an assistant reply. The word "needle" appears only in
+/// an assistant reply (never in a human turn), so it must not match.
+fn grep_fixture() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    let write = |project: &str, file: &str, lines: Vec<String>| {
+        let dir = temp.path().join(project);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(file), lines.join("\n")).unwrap();
+    };
+    write(
+        "grep-a",
+        "g1.jsonl",
+        vec![
+            grep_human_line(
+                "g1",
+                "g1-h1",
+                None,
+                "2026-09-10T01:00:00Z",
+                "first Apple turn",
+            ),
+            assistant_line(
+                "g1",
+                "g1-a1",
+                Some("g1-h1"),
+                "2026-09-10T01:01:00Z",
+                "needle reply",
+            ),
+            grep_human_line(
+                "g1",
+                "g1-h2",
+                Some("g1-a1"),
+                "2026-09-10T02:00:00Z",
+                "second banana turn",
+            ),
+            grep_human_line(
+                "g1",
+                "g1-h3",
+                Some("g1-h2"),
+                "2026-09-11T03:00:00Z",
+                "third APPLE and cherry",
+            ),
+            grep_human_line(
+                "g1",
+                "g1-h4",
+                Some("g1-h3"),
+                "2026-09-12T03:00:00Z",
+                "fourth plain turn",
+            ),
+        ],
+    );
+    write(
+        "grep-b",
+        "g2.jsonl",
+        vec![
+            grep_human_line(
+                "g2",
+                "g2-h1",
+                None,
+                "2026-09-10T04:00:00Z",
+                "other project apple",
+            ),
+            grep_human_line(
+                "g2",
+                "g2-h2",
+                Some("g2-h1"),
+                "2026-09-10T05:00:00Z",
+                "other project plain",
+            ),
+        ],
+    );
+    temp
+}
+
+fn grep_config(root: &Path, dates: DateRange, patterns: &[&str]) -> Config {
+    let mut cfg = range_config(root, dates);
+    cfg.human_filter = patterns.iter().map(|p| (*p).to_owned()).collect();
+    cfg
+}
+
+fn humans(turns: &[tutor::OutputTurn]) -> Vec<&str> {
+    turns.iter().map(|turn| turn.human.as_str()).collect()
+}
+
+#[test]
+fn grep_does_not_match_assistant_context() {
+    let temp = grep_fixture();
+    let mut warnings = Vec::new();
+    let turns = extract(
+        &grep_config(temp.path(), DateRange::single(d(10)), &["needle"]),
+        &mut warnings,
+    )
+    .unwrap();
+    assert!(turns.is_empty());
+
+    // The assistant text is still returned as context for a human-text match.
+    let turns = extract(
+        &grep_config(temp.path(), DateRange::single(d(10)), &["banana"]),
+        &mut warnings,
+    )
+    .unwrap();
+    assert_eq!(humans(&turns), ["second banana turn"]);
+    assert_eq!(turns[0].prev_assistant, "needle reply");
+}
+
+#[test]
+fn grep_ors_patterns_and_ignores_case() {
+    let temp = grep_fixture();
+    let mut warnings = Vec::new();
+    let range = DateRange::new(d(10), d(12)).unwrap();
+
+    let turns = extract(&grep_config(temp.path(), range, &["apple"]), &mut warnings).unwrap();
+    let mut found = humans(&turns);
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            "first Apple turn",
+            "other project apple",
+            "third APPLE and cherry"
+        ]
+    );
+
+    let turns = extract(
+        &grep_config(temp.path(), range, &["BANANA", "Cherry"]),
+        &mut warnings,
+    )
+    .unwrap();
+    let mut found = humans(&turns);
+    found.sort();
+    assert_eq!(found, ["second banana turn", "third APPLE and cherry"]);
+}
+
+#[test]
+fn grep_keeps_turn_indexes_of_an_unfiltered_run() {
+    let temp = grep_fixture();
+    let mut warnings = Vec::new();
+    let range = DateRange::new(d(10), d(12)).unwrap();
+    let all = extract(&grep_config(temp.path(), range, &[]), &mut warnings).unwrap();
+    let filtered = extract(
+        &grep_config(temp.path(), range, &["banana", "cherry"]),
+        &mut warnings,
+    )
+    .unwrap();
+    assert_eq!(filtered.len(), 2);
+    for turn in &filtered {
+        let original = all
+            .iter()
+            .find(|candidate| candidate.session == turn.session && candidate.human == turn.human)
+            .unwrap();
+        assert_eq!(turn.turn_index, original.turn_index);
+    }
+    let banana = filtered
+        .iter()
+        .find(|t| t.human.contains("banana"))
+        .unwrap();
+    assert_eq!(banana.turn_index, 2);
+}
+
+#[test]
+fn grep_combines_with_date_range_and_project_filter() {
+    let temp = grep_fixture();
+    let mut warnings = Vec::new();
+
+    let mut cfg = grep_config(temp.path(), DateRange::single(d(11)), &["apple"]);
+    assert_eq!(
+        humans(&extract(&cfg, &mut warnings).unwrap()),
+        ["third APPLE and cherry"]
+    );
+    cfg.dates = DateRange::new(d(10), d(12)).unwrap();
+    assert_eq!(extract(&cfg, &mut warnings).unwrap().len(), 3);
+
+    cfg.project_filter = Some("grep-b".to_owned());
+    let turns = extract(&cfg, &mut warnings).unwrap();
+    assert_eq!(humans(&turns), ["other project apple"]);
+    assert_eq!(turns[0].project_dir, "grep-b");
+}
+
+#[test]
+fn grep_folds_sigma_forms() {
+    let temp = tempfile::tempdir().unwrap();
+    write_session(
+        temp.path(),
+        "sigma",
+        "s.jsonl",
+        &[
+            ("sg", "2026-09-10T01:00:00Z", "ΟΣ"),
+            ("sg", "2026-09-10T02:00:00Z", "ος"),
+        ],
+    );
+    let mut warnings = Vec::new();
+    for (pattern, expected) in [
+        ("Σ", vec!["ΟΣ", "ος"]),
+        ("σ", vec!["ΟΣ", "ος"]),
+        ("ς", vec!["ΟΣ", "ος"]),
+        ("ΟΣ", vec!["ΟΣ", "ος"]),
+        ("ος", vec!["ΟΣ", "ος"]),
+    ] {
+        let cfg = grep_config(temp.path(), DateRange::single(d(10)), &[pattern]);
+        let turns = extract(&cfg, &mut warnings).unwrap();
+        assert_eq!(humans(&turns), expected, "{pattern}");
+    }
 }
