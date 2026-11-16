@@ -18,7 +18,9 @@
 # 基本的な抽出
 tutor                                            # 今日の人間の発言を抽出 (JSONL)
 tutor --date 2026-09-17 --format md              # 特定日の発言を Markdown 形式で出力
+tutor --since 2026-09-01 --until 2026-09-30      # 期間を指定して抽出 (両端を含むローカル日付)
 tutor projects                                   # 未判定ターンが存在するプロジェクト一覧を表示
+tutor projects --since 2026-09-01                # プロジェクトごとの日別件数を今日まで表示
 
 # インタラクティブな Web レビュー UI
 tutor ui                                         # ブラウザで Web レビュー UI を起動
@@ -36,6 +38,8 @@ tutor mcp                                        # MCP stdio サーバーとし�
 ```
 
 デフォルトでは、`--date` はローカルタイムゾーンの今日、`--projects-dir` は `~/.claude/projects`、出力形式は JSONL です。台帳（デフォルトでは `~/.local/state/tutor/ledger.json`）に `approved` または `rejected` として記録されたレビュー済みターンは、次回以降の抽出から自動的に除外されます。未判定ターンをすべて確認したい場合は `--no-ledger` を指定してください。全オプションは `tutor --help` で確認できます。
+
+`--since` / `--until` は両端を含むローカル日付で、`--date` とは併用できません。`--until` には `--since` が必須で、`--since` だけを指定すると今日までが対象です。期間指定の結果は、各日を個別に実行した場合と同じターン・ターン番号・台帳キーになります。2日以上の期間を指定した `tutor projects` は、プロジェクトごとの日別件数も返します（JSON 出力では `daily_counts`）。期間が長いと抽出結果が大きくなるため、`tutor projects` で件数を確認してから `--project` で絞り込んで抽出してください。
 
 ## インストールと開発 (Installation)
 
@@ -76,8 +80,8 @@ tutor install-mcp
 ```
 
 利用可能な MCP ツール：
-- `tutor_projects`: 会話ログが存在するプロジェクト一覧と未レビュー件数を取得
-- `tutor_extract`: 指定日の未判定ターンと直前文脈を抽出
+- `tutor_projects`: 会話ログが存在するプロジェクト一覧と未レビュー件数を取得（`since` / `until` で期間指定すると日別件数も返す）
+- `tutor_extract`: 指定日または `since` / `until` の期間の未判定ターンと直前文脈を抽出
 - `tutor_review_ui`: ブラウザで Web レビュー UI を起動し、確定結果を待機・返却
 - `tutor_mark`: 判定結果（approved, rejected, deferred）を台帳に記録
 - `tutor_destinations`: 利用可能な宛先テーブルと判断軸ガイドラインを取得

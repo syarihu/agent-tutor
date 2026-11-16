@@ -5,7 +5,10 @@ use chrono::{Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{Config, JudgmentStatus, Ledger, LedgerEntry, OutputFormat, extract, write_output};
+use crate::{
+    Config, DateRange, JudgmentStatus, Ledger, LedgerEntry, OutputFormat, extract,
+    resolve_date_range, write_output,
+};
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -129,13 +132,21 @@ fn handle_request(
             "tools": [
                 {
                     "name": "tutor_projects",
-                    "description": "List all repositories/projects that have unreviewed human conversation turns on the specified date, with turn counts and working directories.",
+                    "description": "List all repositories/projects that have unreviewed human conversation turns on the specified date or date range, with turn counts and working directories. For a multi-day range each project also carries per-day counts (daily_counts).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "date": {
                                 "type": "string",
-                                "description": "Local calendar date to inspect in YYYY-MM-DD format. Defaults to today."
+                                "description": "Local calendar date to inspect in YYYY-MM-DD format. Defaults to today. Cannot be combined with since/until."
+                            },
+                            "since": {
+                                "type": "string",
+                                "description": "First local calendar date of a range, inclusive (YYYY-MM-DD). Without until, the range runs through today. Cannot be combined with date."
+                            },
+                            "until": {
+                                "type": "string",
+                                "description": "Last local calendar date of a range, inclusive (YYYY-MM-DD). Requires since. Cannot be combined with date."
                             },
                             "no_ledger": {
                                 "type": "boolean",
@@ -146,13 +157,21 @@ fn handle_request(
                 },
                 {
                     "name": "tutor_extract",
-                    "description": "Extract unreviewed human turns and preceding assistant context from Claude Code transcripts on a specified local date. Settled turns in the ledger are skipped by default.",
+                    "description": "Extract unreviewed human turns and preceding assistant context from Claude Code transcripts on a specified local date or date range (since/until, inclusive). Settled turns in the ledger are skipped by default. Long ranges can produce large output; narrow them with project.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "date": {
                                 "type": "string",
-                                "description": "Local calendar date to extract in YYYY-MM-DD format. Defaults to today."
+                                "description": "Local calendar date to extract in YYYY-MM-DD format. Defaults to today. Cannot be combined with since/until."
+                            },
+                            "since": {
+                                "type": "string",
+                                "description": "First local calendar date of a range, inclusive (YYYY-MM-DD). Without until, the range runs through today. Cannot be combined with date. Long ranges can produce large output; narrow with project."
+                            },
+                            "until": {
+                                "type": "string",
+                                "description": "Last local calendar date of a range, inclusive (YYYY-MM-DD). Requires since. Cannot be combined with date."
                             },
                             "project": {
                                 "type": "string",
@@ -402,15 +421,37 @@ fn handle_request(
     }
 }
 
+/// Read an optional `YYYY-MM-DD` string argument. A present but non-string, empty or
+/// unparsable value is an error rather than a silent fallback.
+fn date_arg(args: &Value, key: &str) -> Result<Option<NaiveDate>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let text = value
+        .as_str()
+        .ok_or_else(|| format!("'{key}' must be a string in YYYY-MM-DD format"))?;
+    if text.is_empty() {
+        return Err(format!("'{key}' must not be empty"));
+    }
+    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .map(Some)
+        .map_err(|err| format!("Invalid {key} '{text}': {err}"))
+}
+
+/// Parse `date` / `since` / `until` tool arguments into one inclusive range.
+fn date_range_arg(args: &Value, today: NaiveDate) -> Result<DateRange, String> {
+    resolve_date_range(
+        date_arg(args, "date")?,
+        date_arg(args, "since")?,
+        date_arg(args, "until")?,
+        today,
+    )
+}
+
 fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value, String> {
     match name {
         "tutor_projects" => {
-            let date = if let Some(date_str) = args.get("date").and_then(Value::as_str) {
-                NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                    .map_err(|err| format!("Invalid date '{date_str}': {err}"))?
-            } else {
-                Local::now().date_naive()
-            };
+            let dates = date_range_arg(&args, Local::now().date_naive())?;
 
             let no_ledger = args
                 .get("no_ledger")
@@ -423,7 +464,7 @@ fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value
             };
 
             let config = Config {
-                date,
+                dates,
                 projects_dir: default_projects_dir(),
                 boilerplate_threshold: 3,
                 context_chars: 600,
@@ -451,12 +492,7 @@ fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value
         }
 
         "tutor_extract" => {
-            let date = if let Some(date_str) = args.get("date").and_then(Value::as_str) {
-                NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                    .map_err(|err| format!("Invalid date '{date_str}': {err}"))?
-            } else {
-                Local::now().date_naive()
-            };
+            let dates = date_range_arg(&args, Local::now().date_naive())?;
 
             let project = args
                 .get("project")
@@ -478,7 +514,7 @@ fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value
             };
 
             let config = Config {
-                date,
+                dates,
                 projects_dir: default_projects_dir(),
                 boilerplate_threshold: 3,
                 context_chars: 600,
@@ -503,7 +539,7 @@ fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value
                     {
                         "type": "text",
                         "text": if output_text.is_empty() {
-                            format!("No unreviewed turns found for {date}.")
+                            format!("No unreviewed turns found for {dates}.")
                         } else {
                             output_text
                         }
@@ -736,5 +772,69 @@ pub fn generate_review_prompt(date_str: &str, lang: &str) -> String {
                - Linear などの MCP ツール: 対応する MCP ツールを呼び出して起票\n\
                8. 反映したファイル、起票した Issue/タスク、登録した知見の一覧をユーザーに報告して完了する。"
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 9, day).unwrap()
+    }
+
+    #[test]
+    fn date_range_arg_defaults_to_today() {
+        assert_eq!(
+            date_range_arg(&json!({}), d(20)).unwrap(),
+            DateRange::single(d(20))
+        );
+    }
+
+    #[test]
+    fn date_range_arg_accepts_date_and_ranges() {
+        assert_eq!(
+            date_range_arg(&json!({"date": "2026-09-05"}), d(20)).unwrap(),
+            DateRange::single(d(5))
+        );
+        assert_eq!(
+            date_range_arg(&json!({"since": "2026-09-05"}), d(20)).unwrap(),
+            DateRange::new(d(5), d(20)).unwrap()
+        );
+        assert_eq!(
+            date_range_arg(
+                &json!({"since": "2026-09-05", "until": "2026-09-07"}),
+                d(20)
+            )
+            .unwrap(),
+            DateRange::new(d(5), d(7)).unwrap()
+        );
+    }
+
+    #[test]
+    fn date_range_arg_rejects_bad_values() {
+        for args in [
+            json!({"date": 20260905}),
+            json!({"since": null}),
+            json!({"until": true}),
+            json!({"date": ""}),
+            json!({"since": ""}),
+            json!({"date": "not-a-date"}),
+            json!({"since": "2026-13-01"}),
+        ] {
+            assert!(date_range_arg(&args, d(20)).is_err(), "{args}");
+        }
+    }
+
+    #[test]
+    fn date_range_arg_rejects_conflicts() {
+        for args in [
+            json!({"date": "2026-09-05", "since": "2026-09-01"}),
+            json!({"date": "2026-09-05", "until": "2026-09-07"}),
+            json!({"until": "2026-09-07"}),
+            json!({"since": "2026-09-07", "until": "2026-09-05"}),
+        ] {
+            assert!(date_range_arg(&args, d(20)).is_err(), "{args}");
+        }
     }
 }

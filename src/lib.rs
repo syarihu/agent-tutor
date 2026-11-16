@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -85,9 +86,81 @@ impl Ledger {
     }
 }
 
+/// Inclusive range of local calendar dates.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DateRange {
+    since: NaiveDate,
+    until: NaiveDate,
+}
+
+impl DateRange {
+    pub fn new(since: NaiveDate, until: NaiveDate) -> Result<Self, String> {
+        if since > until {
+            return Err(format!(
+                "since ({since}) must not be later than until ({until})"
+            ));
+        }
+        Ok(Self { since, until })
+    }
+
+    pub fn single(date: NaiveDate) -> Self {
+        Self {
+            since: date,
+            until: date,
+        }
+    }
+
+    pub fn since(&self) -> NaiveDate {
+        self.since
+    }
+
+    pub fn until(&self) -> NaiveDate {
+        self.until
+    }
+
+    pub fn contains(&self, date: NaiveDate) -> bool {
+        self.since <= date && date <= self.until
+    }
+
+    pub fn is_single_day(&self) -> bool {
+        self.since == self.until
+    }
+}
+
+impl fmt::Display for DateRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_single_day() {
+            write!(f, "{}", self.since)
+        } else {
+            write!(f, "{}..{}", self.since, self.until)
+        }
+    }
+}
+
+/// Combine the `date` / `since` / `until` options into one range.
+///
+/// Nothing given means today; `since` alone runs through `today`; `date` cannot be combined
+/// with `since` or `until`; `until` needs `since`.
+pub fn resolve_date_range(
+    date: Option<NaiveDate>,
+    since: Option<NaiveDate>,
+    until: Option<NaiveDate>,
+    today: NaiveDate,
+) -> Result<DateRange, String> {
+    match (date, since, until) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            Err("date cannot be combined with since or until".to_owned())
+        }
+        (None, None, Some(_)) => Err("until requires since".to_owned()),
+        (Some(date), None, None) => Ok(DateRange::single(date)),
+        (None, None, None) => Ok(DateRange::single(today)),
+        (None, Some(since), until) => DateRange::new(since, until.unwrap_or(today)),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub date: NaiveDate,
+    pub dates: DateRange,
     pub projects_dir: PathBuf,
     pub boilerplate_threshold: usize,
     pub context_chars: usize,
@@ -107,6 +180,9 @@ pub struct ProjectInfo {
     pub project_dir: String,
     pub cwd: String,
     pub turns_count: usize,
+    /// Per-day turn counts keyed by "YYYY-MM-DD". Present only for multi-day ranges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_counts: Option<BTreeMap<String, usize>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
@@ -150,6 +226,7 @@ struct Candidate {
     record_index: usize,
     session: String,
     cwd: String,
+    local_date: NaiveDate,
     timestamp_local: String,
     human: String,
     parent_uuid: Option<String>,
@@ -164,41 +241,31 @@ struct SessionFile {
 
 /// Extract all matching turns. Malformed transcript lines are reported to `warnings` and skipped.
 pub fn extract(config: &Config, warnings: &mut impl Write) -> io::Result<Vec<OutputTurn>> {
-    let mut paths = Vec::new();
-    collect_jsonl_files(&config.projects_dir, &mut paths)?;
-    paths.sort();
+    let Loaded { files, boilerplate } = load_files(config, warnings)?;
 
-    let mut files = Vec::new();
-    let mut prompt_sessions: HashMap<String, HashSet<String>> = HashMap::new();
-
-    for path in paths {
-        let session_file = parse_file(&path, config, warnings)?;
-        for candidate in &session_file.candidates {
-            prompt_sessions
-                .entry(candidate.human.clone())
-                .or_default()
-                .insert(candidate.session.clone());
-        }
-        files.push(session_file);
-    }
-
-    let boilerplate: HashSet<String> = prompt_sessions
+    let multi_day = !config.dates.is_single_day();
+    let mut removed: Vec<(NaiveDate, &String, usize)> = boilerplate
         .iter()
-        .filter(|(_, sessions)| sessions.len() >= config.boilerplate_threshold)
-        .map(|(prompt, _)| prompt.clone())
+        .flat_map(|(date, prompts)| {
+            prompts
+                .iter()
+                .map(move |(prompt, count)| (*date, prompt, *count))
+        })
         .collect();
-
-    let mut removed: Vec<_> = boilerplate
-        .iter()
-        .map(|prompt| (prompt, prompt_sessions[prompt].len()))
-        .collect();
-    removed.sort_by(|left, right| left.0.cmp(right.0));
-    for (prompt, count) in removed {
+    removed.sort_by(|left, right| left.1.cmp(right.1).then(left.0.cmp(&right.0)));
+    for (date, prompt, count) in removed {
         let rendered = serde_json::to_string(prompt).unwrap_or_else(|_| "<unprintable>".into());
-        writeln!(
-            warnings,
-            "tutor: excluded boilerplate seen in {count} distinct sessions: {rendered}"
-        )?;
+        if multi_day {
+            writeln!(
+                warnings,
+                "tutor: excluded boilerplate seen in {count} distinct sessions on {date}: {rendered}"
+            )?;
+        } else {
+            writeln!(
+                warnings,
+                "tutor: excluded boilerplate seen in {count} distinct sessions: {rendered}"
+            )?;
+        }
     }
 
     let ledger = config
@@ -209,9 +276,10 @@ pub fn extract(config: &Config, warnings: &mut impl Write) -> io::Result<Vec<Out
 
     let mut output = Vec::new();
     for file in files {
-        if let Some(filter) = &config.project_filter
-            && !file.project_dir.contains(filter)
-            && !file.candidates.iter().any(|c| c.cwd.contains(filter))
+        if !file
+            .candidates
+            .iter()
+            .any(|candidate| candidate_matches(config, &file, candidate))
         {
             continue;
         }
@@ -222,25 +290,11 @@ pub fn extract(config: &Config, warnings: &mut impl Write) -> io::Result<Vec<Out
             .enumerate()
             .filter_map(|(index, record)| record.uuid.as_deref().map(|uuid| (uuid, index)))
             .collect();
-        for (turn_offset, candidate) in file
-            .candidates
-            .iter()
-            .filter(|candidate| !boilerplate.contains(&candidate.human))
-            .enumerate()
-        {
-            if let Some(filter) = &config.project_filter
-                && !file.project_dir.contains(filter)
-                && !candidate.cwd.contains(filter)
-            {
-                continue;
-            }
-            if let Some(cwd) = &config.cwd_filter
-                && Path::new(&candidate.cwd) != cwd
-            {
+        for (turn_index, candidate) in file.numbered_candidates(&boilerplate) {
+            if !candidate_matches(config, &file, candidate) {
                 continue;
             }
 
-            let turn_index = turn_offset + 1;
             if let Some(ledger) = &ledger
                 && ledger.is_reviewed(&candidate.session, turn_index)
             {
@@ -261,7 +315,7 @@ pub fn extract(config: &Config, warnings: &mut impl Write) -> io::Result<Vec<Out
                 session: candidate.session.clone(),
                 project_dir: file.project_dir.clone(),
                 cwd: candidate.cwd.clone(),
-                turn_index: turn_offset + 1,
+                turn_index,
                 timestamp_local: candidate.timestamp_local.clone(),
                 human: candidate.human.clone(),
                 prev_assistant,
@@ -274,31 +328,11 @@ pub fn extract(config: &Config, warnings: &mut impl Write) -> io::Result<Vec<Out
     Ok(output)
 }
 
-/// List all projects with unreviewed human turns on the specified date.
+/// List all projects with unreviewed human turns in the configured date range.
+///
+/// When the range spans more than one day, each project also carries per-day counts.
 pub fn list_projects(config: &Config, warnings: &mut impl Write) -> io::Result<Vec<ProjectInfo>> {
-    let mut paths = Vec::new();
-    collect_jsonl_files(&config.projects_dir, &mut paths)?;
-    paths.sort();
-
-    let mut files = Vec::new();
-    let mut prompt_sessions: HashMap<String, HashSet<String>> = HashMap::new();
-
-    for path in paths {
-        let session_file = parse_file(&path, config, warnings)?;
-        for candidate in &session_file.candidates {
-            prompt_sessions
-                .entry(candidate.human.clone())
-                .or_default()
-                .insert(candidate.session.clone());
-        }
-        files.push(session_file);
-    }
-
-    let boilerplate: HashSet<String> = prompt_sessions
-        .iter()
-        .filter(|(_, sessions)| sessions.len() >= config.boilerplate_threshold)
-        .map(|(prompt, _)| prompt.clone())
-        .collect();
+    let Loaded { files, boilerplate } = load_files(config, warnings)?;
 
     let ledger = config
         .ledger_path
@@ -306,16 +340,10 @@ pub fn list_projects(config: &Config, warnings: &mut impl Write) -> io::Result<V
         .map(Ledger::load)
         .transpose()?;
 
-    let mut project_counts: HashMap<(String, String), usize> = HashMap::new();
+    let mut project_counts: HashMap<(String, String), BTreeMap<NaiveDate, usize>> = HashMap::new();
 
     for file in files {
-        for (turn_offset, candidate) in file
-            .candidates
-            .iter()
-            .filter(|candidate| !boilerplate.contains(&candidate.human))
-            .enumerate()
-        {
-            let turn_index = turn_offset + 1;
+        for (turn_index, candidate) in file.numbered_candidates(&boilerplate) {
             if let Some(ledger) = &ledger
                 && ledger.is_reviewed(&candidate.session, turn_index)
             {
@@ -324,16 +352,25 @@ pub fn list_projects(config: &Config, warnings: &mut impl Write) -> io::Result<V
 
             *project_counts
                 .entry((file.project_dir.clone(), candidate.cwd.clone()))
+                .or_default()
+                .entry(candidate.local_date)
                 .or_insert(0) += 1;
         }
     }
 
+    let multi_day = !config.dates.is_single_day();
     let mut results: Vec<ProjectInfo> = project_counts
         .into_iter()
-        .map(|((project_dir, cwd), turns_count)| ProjectInfo {
+        .map(|((project_dir, cwd), per_day)| ProjectInfo {
             project_dir,
             cwd,
-            turns_count,
+            turns_count: per_day.values().sum(),
+            daily_counts: multi_day.then(|| {
+                per_day
+                    .into_iter()
+                    .map(|(date, count)| (date.to_string(), count))
+                    .collect()
+            }),
         })
         .collect();
 
@@ -344,6 +381,86 @@ pub fn list_projects(config: &Config, warnings: &mut impl Write) -> io::Result<V
     });
 
     Ok(results)
+}
+
+/// Parsed transcripts plus the prompts treated as boilerplate on each local date.
+struct Loaded {
+    files: Vec<SessionFile>,
+    /// local date -> prompt -> number of distinct sessions that sent it that day.
+    /// Only prompts at or above `boilerplate_threshold` are kept.
+    boilerplate: HashMap<NaiveDate, HashMap<String, usize>>,
+}
+
+fn load_files(config: &Config, warnings: &mut impl Write) -> io::Result<Loaded> {
+    let mut paths = Vec::new();
+    collect_jsonl_files(&config.projects_dir, &mut paths)?;
+    paths.sort();
+
+    let mut files = Vec::new();
+    let mut prompt_sessions: HashMap<(NaiveDate, String), HashSet<String>> = HashMap::new();
+
+    for path in paths {
+        let session_file = parse_file(&path, config, warnings)?;
+        for candidate in &session_file.candidates {
+            prompt_sessions
+                .entry((candidate.local_date, candidate.human.clone()))
+                .or_default()
+                .insert(candidate.session.clone());
+        }
+        files.push(session_file);
+    }
+
+    let mut boilerplate: HashMap<NaiveDate, HashMap<String, usize>> = HashMap::new();
+    for ((date, prompt), sessions) in prompt_sessions {
+        if sessions.len() >= config.boilerplate_threshold {
+            boilerplate
+                .entry(date)
+                .or_default()
+                .insert(prompt, sessions.len());
+        }
+    }
+
+    Ok(Loaded { files, boilerplate })
+}
+
+impl SessionFile {
+    /// Non-boilerplate candidates with their 1-based turn index, numbered per local date so a
+    /// range yields the same ledger keys as running each day on its own.
+    fn numbered_candidates<'a>(
+        &'a self,
+        boilerplate: &HashMap<NaiveDate, HashMap<String, usize>>,
+    ) -> Vec<(usize, &'a Candidate)> {
+        let mut per_date: HashMap<NaiveDate, usize> = HashMap::new();
+        self.candidates
+            .iter()
+            .filter(|candidate| {
+                !boilerplate
+                    .get(&candidate.local_date)
+                    .is_some_and(|prompts| prompts.contains_key(&candidate.human))
+            })
+            .map(|candidate| {
+                let counter = per_date.entry(candidate.local_date).or_insert(0);
+                *counter += 1;
+                (*counter, candidate)
+            })
+            .collect()
+    }
+}
+
+/// Per-candidate filters for `extract`. Add new filters here.
+fn candidate_matches(config: &Config, file: &SessionFile, candidate: &Candidate) -> bool {
+    if let Some(filter) = &config.project_filter
+        && !file.project_dir.contains(filter)
+        && !candidate.cwd.contains(filter)
+    {
+        return false;
+    }
+    if let Some(cwd) = &config.cwd_filter
+        && Path::new(&candidate.cwd) != cwd
+    {
+        return false;
+    }
+    true
 }
 
 pub fn write_output(
@@ -419,13 +536,14 @@ fn parse_file(path: &Path, config: &Config, warnings: &mut impl Write) -> io::Re
         if is_human
             && let Some(human) = value.pointer("/message/content").and_then(Value::as_str)
             && let Some(timestamp) = string_field(&value, "timestamp")
-            && let Some(timestamp_local) = local_timestamp_on_date(timestamp, config)
+            && let Some((local_date, timestamp_local)) = local_timestamp_in_range(timestamp, config)
             && let Some(session) = string_field(&value, "sessionId")
         {
             candidates.push(Candidate {
                 record_index,
                 session: session.to_owned(),
                 cwd: string_field(&value, "cwd").unwrap_or_default().to_owned(),
+                local_date,
                 timestamp_local,
                 human: human.to_owned(),
                 parent_uuid: parent_uuid.clone(),
@@ -518,16 +636,24 @@ fn is_guidance_path(path: &str) -> bool {
     path.contains("/memory/") || path.ends_with("CLAUDE.md") || path.ends_with("AGENTS.md")
 }
 
-fn local_timestamp_on_date(timestamp: &str, config: &Config) -> Option<String> {
+fn local_timestamp_in_range(timestamp: &str, config: &Config) -> Option<(NaiveDate, String)> {
     let utc: DateTime<Utc> = DateTime::parse_from_rfc3339(timestamp)
         .ok()?
         .with_timezone(&Utc);
     if let Some(offset) = config.fixed_offset {
         let local = utc.with_timezone(&offset);
-        (local.date_naive() == config.date).then(|| local.to_rfc3339())
+        let date = local.date_naive();
+        config
+            .dates
+            .contains(date)
+            .then(|| (date, local.to_rfc3339()))
     } else {
         let local = utc.with_timezone(&Local);
-        (local.date_naive() == config.date).then(|| local.to_rfc3339())
+        let date = local.date_naive();
+        config
+            .dates
+            .contains(date)
+            .then(|| (date, local.to_rfc3339()))
     }
 }
 
