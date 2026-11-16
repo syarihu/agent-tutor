@@ -17,6 +17,8 @@ Instead of repeating corrections or manually maintaining rules, `tutor` extracts
 tutor                                            # Extract today's human turns (JSONL)
 tutor --date 2026-09-17 --format md              # Markdown output for a specific date
 tutor --since 2026-09-01 --until 2026-09-30      # Extract a date range (inclusive, local dates)
+tutor --grep "migration"                         # Only turns whose human text contains "migration"
+tutor --since 2026-09-01 --grep lint --grep format  # Range, keeping turns that mention lint or format
 tutor projects                                   # List projects with unreviewed turns
 tutor projects --since 2026-09-01                # Per-day counts per project, through today
 
@@ -46,6 +48,12 @@ turn indexes, and ledger keys as running each day separately. With a range of mo
 `tutor projects` also reports per-day counts (`daily_counts` in JSON output). Long ranges can produce
 a lot of extraction output, so check the counts with `tutor projects` first and narrow the extraction
 with `--project`.
+
+`--grep <TEXT>` keeps only turns whose human text contains TEXT. It is a literal, case-insensitive
+substring match (not a regex), and the preceding assistant context is never searched. Repeat the flag
+to match any of several values (OR). Filtering happens after turns are numbered, so a matched turn
+keeps the same turn index and ledger key as in an unfiltered run. `tutor projects` has no `--grep` option,
+so its counts are not filtered by it and include turns the filter would drop.
 
 ## Installation and Development
 
@@ -87,7 +95,7 @@ Or manually configure your MCP client:
 
 Available MCP tools:
 - `tutor_projects`: List repositories/projects with unreviewed turns for a local date or an inclusive `since`/`until` range (per-day counts for ranges)
-- `tutor_extract`: Extract candidate turns and context for a local date or an inclusive `since`/`until` range
+- `tutor_extract`: Extract candidate turns and context for a local date or an inclusive `since`/`until` range, optionally filtered with `grep` (a string or an array of strings; literal, case-insensitive substrings of the human text, OR-matched)
 - `tutor_review_ui`: Launch interactive Web Review UI in browser and return finalized decisions
 - `tutor_mark`: Record review decisions (approved, rejected, deferred) into the ledger
 - `tutor_destinations`: Get the canonical destinations table and triaging guidelines

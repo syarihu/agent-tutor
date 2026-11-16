@@ -157,7 +157,7 @@ fn handle_request(
                 },
                 {
                     "name": "tutor_extract",
-                    "description": "Extract unreviewed human turns and preceding assistant context from Claude Code transcripts on a specified local date or date range (since/until, inclusive). Settled turns in the ledger are skipped by default. Long ranges can produce large output; narrow them with project.",
+                    "description": "Extract unreviewed human turns and preceding assistant context from Claude Code transcripts on a specified local date or date range (since/until, inclusive). Settled turns in the ledger are skipped by default. Long ranges can produce large output; narrow them with project or grep. grep keeps only turns whose human text contains a literal, case-insensitive substring (not a regex; an array matches any of its values).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -176,6 +176,11 @@ fn handle_request(
                             "project": {
                                 "type": "string",
                                 "description": "Optional filter by project directory slug or repository substring (e.g. 'agent-proctor', 'dotfiles')."
+                            },
+                            "grep": {
+                                "type": ["string", "array"],
+                                "items": {"type": "string"},
+                                "description": "Optional filter on the human turn's text: a literal, case-insensitive substring (not a regex), or an array of them where a turn matching any one is kept (OR). Only the human text is searched, not the assistant context. Values must not be empty or whitespace-only. turn_index stays the same as in an unfiltered run."
                             },
                             "no_ledger": {
                                 "type": "boolean",
@@ -438,6 +443,34 @@ fn date_arg(args: &Value, key: &str) -> Result<Option<NaiveDate>, String> {
         .map_err(|err| format!("Invalid {key} '{text}': {err}"))
 }
 
+/// Read the optional `grep` argument: a non-blank string or a non-empty array of non-blank
+/// strings. Anything else is an error rather than a silently ignored filter.
+fn grep_arg(args: &Value) -> Result<Vec<String>, String> {
+    let Some(value) = args.get("grep") else {
+        return Ok(Vec::new());
+    };
+    let items = match value {
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(values) => {
+            if values.is_empty() {
+                return Err("'grep' must not be an empty array".to_owned());
+            }
+            values
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .ok_or_else(|| "'grep' array elements must be strings".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        _ => return Err("'grep' must be a string or an array of strings".to_owned()),
+    };
+    if items.iter().any(|text| text.trim().is_empty()) {
+        return Err("'grep' values must not be empty or whitespace-only".to_owned());
+    }
+    Ok(items.into_iter().map(str::to_owned).collect())
+}
+
 /// Parse `date` / `since` / `until` tool arguments into one inclusive range.
 fn date_range_arg(args: &Value, today: NaiveDate) -> Result<DateRange, String> {
     resolve_date_range(
@@ -473,6 +506,7 @@ fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value
                 ledger_path,
                 project_filter: None,
                 cwd_filter: None,
+                human_filter: Vec::new(),
             };
 
             let projects = crate::list_projects(&config, warnings)
@@ -494,6 +528,7 @@ fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value
         "tutor_extract" => {
             let dates = date_range_arg(&args, Local::now().date_naive())?;
 
+            let grep = grep_arg(&args)?;
             let project = args
                 .get("project")
                 .and_then(Value::as_str)
@@ -523,6 +558,7 @@ fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value
                 ledger_path,
                 project_filter: project,
                 cwd_filter: None,
+                human_filter: grep.clone(),
             };
 
             let turns =
@@ -539,7 +575,18 @@ fn call_tool(name: &str, args: Value, warnings: &mut impl Write) -> Result<Value
                     {
                         "type": "text",
                         "text": if output_text.is_empty() {
-                            format!("No unreviewed turns found for {dates}.")
+                            if grep.is_empty() {
+                                format!("No unreviewed turns found for {dates}.")
+                            } else {
+                                let patterns = grep
+                                    .iter()
+                                    .map(|pattern| format!("{pattern:?}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!(
+                                    "No unreviewed turns found for {dates} matching grep {patterns}."
+                                )
+                            }
                         } else {
                             output_text
                         }
@@ -835,6 +882,35 @@ mod tests {
             json!({"since": "2026-09-07", "until": "2026-09-05"}),
         ] {
             assert!(date_range_arg(&args, d(20)).is_err(), "{args}");
+        }
+    }
+
+    #[test]
+    fn grep_arg_accepts_string_and_array() {
+        assert!(grep_arg(&json!({})).unwrap().is_empty());
+        assert_eq!(grep_arg(&json!({"grep": "foo"})).unwrap(), ["foo"]);
+        assert_eq!(
+            grep_arg(&json!({"grep": ["foo", "Bar baz"]})).unwrap(),
+            ["foo", "Bar baz"]
+        );
+    }
+
+    #[test]
+    fn grep_arg_rejects_bad_values() {
+        for args in [
+            json!({"grep": null}),
+            json!({"grep": 1}),
+            json!({"grep": true}),
+            json!({"grep": {}}),
+            json!({"grep": []}),
+            json!({"grep": ""}),
+            json!({"grep": "  "}),
+            json!({"grep": ["ok", ""]}),
+            json!({"grep": ["ok", " \t"]}),
+            json!({"grep": ["ok", 1]}),
+            json!({"grep": [null]}),
+        ] {
+            assert!(grep_arg(&args).is_err(), "{args}");
         }
     }
 }

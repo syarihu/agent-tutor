@@ -84,6 +84,11 @@ struct ExtractArgs {
     #[arg(long, value_name = "PATH")]
     cwd: Option<PathBuf>,
 
+    /// Keep only turns whose human text contains TEXT (literal, case-insensitive substring, not a
+    /// regex). Repeat to match any of several values (OR). The assistant context is not searched.
+    #[arg(long, value_name = "TEXT", value_parser = non_blank_text)]
+    grep: Vec<String>,
+
     /// Exclude identical prompts seen in at least this many distinct sessions.
     #[arg(long, default_value_t = 3, value_name = "N")]
     boilerplate_threshold: usize,
@@ -258,6 +263,14 @@ fn resolve_ledger_path(specified: Option<PathBuf>, no_ledger: bool) -> Option<Pa
     }
 }
 
+fn non_blank_text(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("must not be empty or whitespace-only".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
 fn handle_extract(args: ExtractArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ledger_path = resolve_ledger_path(args.ledger, args.no_ledger);
     let config = Config {
@@ -270,6 +283,7 @@ fn handle_extract(args: ExtractArgs) -> Result<(), Box<dyn std::error::Error>> {
         ledger_path,
         project_filter: args.project,
         cwd_filter: args.cwd,
+        human_filter: args.grep,
     };
 
     let mut stderr = io::stderr().lock();
@@ -291,6 +305,7 @@ fn handle_projects(args: ProjectsArgs) -> Result<(), Box<dyn std::error::Error>>
         ledger_path,
         project_filter: None,
         cwd_filter: None,
+        human_filter: Vec::new(),
     };
 
     let mut stderr = io::stderr().lock();
@@ -510,6 +525,7 @@ fn handle_ui(args: UiArgs) -> Result<(), Box<dyn std::error::Error>> {
             ledger_path: ledger_path.clone(),
             project_filter: args.project,
             cwd_filter: args.cwd,
+            human_filter: Vec::new(),
         };
         let mut stderr = io::stderr().lock();
         let turns = extract(&config, &mut stderr)?;
@@ -606,5 +622,41 @@ mod tests {
             panic!("expected extract");
         };
         assert!(args.dates.resolve().is_err());
+    }
+
+    #[test]
+    fn accepts_repeated_grep() {
+        let Some(Commands::Extract(args)) =
+            parse(&["extract", "--grep", "foo", "--grep", "Bar baz"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected extract");
+        };
+        assert_eq!(args.grep, ["foo", "Bar baz"]);
+        assert!(parse(&["--grep", "foo"]).is_ok());
+    }
+
+    #[test]
+    fn rejects_blank_grep() {
+        assert!(parse(&["extract", "--grep", ""]).is_err());
+        assert!(parse(&["extract", "--grep", "   "]).is_err());
+        assert!(parse(&["extract", "--grep", "ok", "--grep", " "]).is_err());
+    }
+
+    #[test]
+    fn grep_combines_with_date_range() {
+        assert!(
+            parse(&[
+                "extract",
+                "--since",
+                "2026-09-01",
+                "--until",
+                "2026-09-30",
+                "--grep",
+                "foo"
+            ])
+            .is_ok()
+        );
     }
 }

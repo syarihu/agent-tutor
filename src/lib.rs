@@ -173,6 +173,9 @@ pub struct Config {
     pub project_filter: Option<String>,
     /// Optional filter by working directory path.
     pub cwd_filter: Option<PathBuf>,
+    /// Literal, case-insensitive substrings matched against the human turn's text only (never the
+    /// assistant context). A turn passes if it contains any of them. Empty means no filter.
+    pub human_filter: Vec<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -274,13 +277,21 @@ pub fn extract(config: &Config, warnings: &mut impl Write) -> io::Result<Vec<Out
         .map(Ledger::load)
         .transpose()?;
 
+    let human_patterns: Vec<String> = config
+        .human_filter
+        .iter()
+        .map(|pattern| fold_case(pattern))
+        .collect();
+
     let mut output = Vec::new();
     for file in files {
-        if !file
-            .candidates
-            .iter()
-            .any(|candidate| candidate_matches(config, &file, candidate))
-        {
+        // Filter after numbering so turn indexes match an unfiltered run.
+        let matching: Vec<(usize, &Candidate)> = file
+            .numbered_candidates(&boilerplate)
+            .into_iter()
+            .filter(|(_, candidate)| candidate_matches(config, &human_patterns, &file, candidate))
+            .collect();
+        if matching.is_empty() {
             continue;
         }
 
@@ -290,11 +301,7 @@ pub fn extract(config: &Config, warnings: &mut impl Write) -> io::Result<Vec<Out
             .enumerate()
             .filter_map(|(index, record)| record.uuid.as_deref().map(|uuid| (uuid, index)))
             .collect();
-        for (turn_index, candidate) in file.numbered_candidates(&boilerplate) {
-            if !candidate_matches(config, &file, candidate) {
-                continue;
-            }
-
+        for (turn_index, candidate) in matching {
             if let Some(ledger) = &ledger
                 && ledger.is_reviewed(&candidate.session, turn_index)
             {
@@ -447,8 +454,26 @@ impl SessionFile {
     }
 }
 
+/// Case-insensitive comparison form of `text`: lowercase char by char, then map final sigma 'ς'
+/// to 'σ'. `str::to_lowercase` is context-sensitive (a word-final 'Σ' becomes 'ς'), so a pattern
+/// and the text it occurs in could fold differently. This approximates Unicode simple case
+/// folding for that case; std has no full case folding and we add no dependency for it.
+fn fold_case(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| if c == 'ς' { 'σ' } else { c })
+        .collect()
+}
+
 /// Per-candidate filters for `extract`. Add new filters here.
-fn candidate_matches(config: &Config, file: &SessionFile, candidate: &Candidate) -> bool {
+///
+/// `human_patterns` are `config.human_filter` already lowercased by the caller.
+fn candidate_matches(
+    config: &Config,
+    human_patterns: &[String],
+    file: &SessionFile,
+    candidate: &Candidate,
+) -> bool {
     if let Some(filter) = &config.project_filter
         && !file.project_dir.contains(filter)
         && !candidate.cwd.contains(filter)
@@ -459,6 +484,15 @@ fn candidate_matches(config: &Config, file: &SessionFile, candidate: &Candidate)
         && Path::new(&candidate.cwd) != cwd
     {
         return false;
+    }
+    if !human_patterns.is_empty() {
+        let human = fold_case(&candidate.human);
+        if !human_patterns
+            .iter()
+            .any(|pattern| human.contains(pattern.as_str()))
+        {
+            return false;
+        }
     }
     true
 }
