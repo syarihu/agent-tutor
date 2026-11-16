@@ -14,6 +14,7 @@ fn test_review_ui_http_lifecycle_and_ledger() {
     let initial_items = vec![ReviewItem {
         session: "test-session-123".to_string(),
         turn_index: 4,
+        date: Some("2026-09-18".to_string()),
         project_dir: Some("test-project".to_string()),
         cwd: Some("/path/to/test".to_string()),
         timestamp_local: Some("2026-09-18 10:00:00".to_string()),
@@ -125,9 +126,128 @@ fn test_review_ui_http_lifecycle_and_ledger() {
 
     // Check that ledger was updated with human reason
     let ledger = Ledger::load(&ledger_path).unwrap();
-    assert!(ledger.is_reviewed("test-session-123", 4));
-    let entry = ledger.entries.get("test-session-123:4").unwrap();
+    assert!(ledger.is_reviewed("test-session-123", "2026-09-18", 4));
+    let entry = ledger.entries.get("test-session-123:2026-09-18:4").unwrap();
     assert_eq!(entry.status, JudgmentStatus::Rejected);
     assert_eq!(entry.destination.as_deref(), Some("discard"));
     assert_eq!(entry.reason.as_deref(), Some("個人設定のため不要"));
+}
+
+fn item(session: &str, turn: usize, date: Option<&str>, timestamp: Option<&str>) -> ReviewItem {
+    ReviewItem {
+        session: session.to_string(),
+        turn_index: turn,
+        date: date.map(str::to_string),
+        project_dir: None,
+        cwd: None,
+        timestamp_local: timestamp.map(str::to_string),
+        human: "x".to_string(),
+        prev_assistant: None,
+        status: "approved".to_string(),
+        destination: "discard".to_string(),
+        reason: None,
+        user_comment: None,
+        draft_diff: None,
+        file_path: None,
+    }
+}
+
+#[test]
+fn review_ui_rejects_undated_items_before_launching() {
+    let dir = tempdir().unwrap();
+    let ledger_path = dir.path().join("ledger.json");
+    let items = vec![
+        item("ok", 1, Some("2026-09-18"), None),
+        item("bad", 2, None, None),
+        item("badfmt", 3, Some("2026-9-1"), None),
+    ];
+    let error = run_review_ui(items, Some(0), false, Some(&ledger_path), Some(Vec::new()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("bad:2") && error.contains("badfmt:3"),
+        "{error}"
+    );
+    assert!(!error.contains("ok:1"), "{error}");
+    assert!(!ledger_path.exists());
+}
+
+#[test]
+fn review_ui_records_same_turn_index_on_different_dates_separately() {
+    let dir = tempdir().unwrap();
+    let ledger_path = dir.path().join("ledger.json");
+    let items = vec![
+        item("mid", 1, Some("2026-09-10"), None),
+        item("mid", 1, None, Some("2026-09-11T00:30:00+09:00")),
+    ];
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let submitted = items.clone();
+    let path = ledger_path.clone();
+    let server = thread::spawn(move || {
+        run_review_ui(items, Some(port), false, Some(&path), Some(Vec::new())).unwrap()
+    });
+    thread::sleep(std::time::Duration::from_millis(100));
+
+    let payload = serde_json::to_vec(&serde_json::json!({ "items": submitted })).unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let req = format!(
+        "POST /api/submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        payload.len()
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.write_all(&payload).unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    assert!(resp.starts_with("HTTP/1.1 200 OK"));
+    server.join().unwrap();
+
+    let ledger = Ledger::load(&ledger_path).unwrap();
+    assert_eq!(ledger.entries.len(), 2);
+    assert!(ledger.entries.contains_key("mid:2026-09-10:1"));
+    assert!(ledger.entries.contains_key("mid:2026-09-11:1"));
+}
+
+#[test]
+fn review_ui_submit_with_undated_item_gets_an_error_and_keeps_waiting() {
+    let dir = tempdir().unwrap();
+    let ledger_path = dir.path().join("ledger.json");
+    let items = vec![item("s", 1, Some("2026-09-10"), None)];
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let path = ledger_path.clone();
+    let initial = items.clone();
+    let server = thread::spawn(move || {
+        run_review_ui(initial, Some(port), false, Some(&path), Some(Vec::new())).unwrap()
+    });
+    thread::sleep(std::time::Duration::from_millis(100));
+
+    let post = |items: &[ReviewItem]| {
+        let payload = serde_json::to_vec(&serde_json::json!({ "items": items })).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let req = format!(
+            "POST /api/submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        stream.write_all(&payload).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        resp
+    };
+    let bad = post(&[item("s", 1, None, None)]);
+    assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+    assert!(!ledger_path.exists());
+    assert!(post(&items).starts_with("HTTP/1.1 200 OK"));
+    server.join().unwrap();
+    assert!(
+        Ledger::load(&ledger_path)
+            .unwrap()
+            .entries
+            .contains_key("s:2026-09-10:1")
+    );
 }

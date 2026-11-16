@@ -515,7 +515,11 @@ async function submitReview() {
       body: JSON.stringify({ items: reviewItems })
     });
 
-    if (!res.ok) throw new Error("サーバーからエラーが返されました");
+    if (!res.ok) {
+      let detail = "サーバーからエラーが返されました";
+      try { detail = (await res.json()).error || detail; } catch (_) {}
+      throw new Error(detail);
+    }
 
     document.getElementById("main-view").style.display = "none";
     document.querySelector("header").style.display = "none";

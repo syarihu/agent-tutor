@@ -30,7 +30,8 @@ tutor ui --project my-project                    # Launch review UI for a specif
 tutor destinations                               # Inspect detected destination layers
 tutor destinations --reset                       # Re-scan environment and reset destinations config
 tutor ledger                                     # Inspect reviewed turns ledger
-tutor mark --session <SESSION_ID> --turn 1 --status approved --destination project_claude
+tutor ledger --migrate                           # Add dates to ledger entries written by older versions
+tutor mark --session <SESSION_ID> --turn 1 --date 2026-09-17 --status approved --destination project_claude
 
 # MCP Setup & Server
 tutor install-mcp                                # Configure MCP server in ~/.claude.json
@@ -43,8 +44,8 @@ status in the ledger (`~/.local/state/tutor/ledger.json` by default) are automat
 from extraction. Pass `--no-ledger` to inspect all candidate turns. Run `tutor --help` for all options.
 
 `--since` / `--until` take inclusive local calendar dates and cannot be combined with `--date`;
-`--until` requires `--since`, and `--since` alone runs through today. A range returns the same turns,
-turn indexes, and ledger keys as running each day separately. With a range of more than one day,
+`--until` requires `--since`, and `--since` alone runs through today. A range returns the same turns
+and turn indexes as running each day separately. With a range of more than one day,
 `tutor projects` also reports per-day counts (`daily_counts` in JSON output). Long ranges can produce
 a lot of extraction output, so check the counts with `tutor projects` first and narrow the extraction
 with `--project`.
@@ -52,8 +53,33 @@ with `--project`.
 `--grep <TEXT>` keeps only turns whose human text contains TEXT. It is a literal, case-insensitive
 substring match (not a regex), and the preceding assistant context is never searched. Repeat the flag
 to match any of several values (OR). Filtering happens after turns are numbered, so a matched turn
-keeps the same turn index and ledger key as in an unfiltered run. `tutor projects` has no `--grep` option,
+keeps the same turn index as in an unfiltered run. `tutor projects` has no `--grep` option,
 so its counts are not filtered by it and include turns the filter would drop.
+
+## Ledger keys
+
+`turn_index` restarts at 1 every local day, so a session that runs past midnight has a turn 1 on each
+day. Ledger entries are therefore keyed by `session:YYYY-MM-DD:turn_index`, and every extracted turn
+carries its local `date`. `tutor mark` needs `--date` (batch entries and the MCP `tutor_mark` need a
+`date` too), taken from the extracted turn. Older entries keyed `session:turn_index` stay readable:
+a turn is skipped when its dated entry says approved or rejected, or, if it has no dated entry, when
+the legacy entry does. A dated entry always wins over a legacy one.
+
+`tutor ledger --migrate [--ledger PATH] [--projects-dir PATH] [--boilerplate-threshold N]` gives legacy
+entries a date. It renumbers the transcripts the same way `extract` does, finds the turn each legacy
+entry points at, and moves the entry to the dated key; entries that lost their `date` field are
+repaired from their key. The ledger is copied to `<ledger>.bak-<timestamp>` first, and nothing is
+written when nothing changes. The counts of migrated, ambiguous, not found and repaired entries go to
+stderr. Limits:
+
+- If a midnight-spanning session already had a turn N on both days when the entry was marked (judged by
+  its `timestamp`), the entry stays legacy, and keeps hiding turn N on both days.
+- Entries whose transcripts were deleted stay legacy.
+- Numbering is recomputed from the current transcripts and the current timezone, so deleted files or a
+  timezone change since the entry was made can assign the wrong date. Use the same
+  `--boilerplate-threshold` that `extract` used.
+
+An older `tutor` binary does not recognise the dated keys: it treats those turns as unreviewed.
 
 ## Installation and Development
 
@@ -127,7 +153,7 @@ Run `tutor destinations` to inspect the detected layers, or edit `~/.config/tuto
 The default output contains one JSON object per selected turn:
 
 ```json
-{"session":"session-id","project_dir":"-Users-example-project","cwd":"/Users/example/project","turn_index":1,"timestamp_local":"2026-09-17T11:04:07+09:00","human":"please fix this","prev_assistant":"What should I change?","prev_tools":[],"already_captured":false}
+{"session":"session-id","project_dir":"-Users-example-project","cwd":"/Users/example/project","turn_index":1,"date":"2026-09-17","timestamp_local":"2026-09-17T11:04:07+09:00","human":"please fix this","prev_assistant":"What should I change?","prev_tools":[],"already_captured":false}
 ```
 
 `--format md` groups the same information beneath session headings, with one block per turn.

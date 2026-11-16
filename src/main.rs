@@ -116,9 +116,13 @@ struct MarkArgs {
     #[arg(long)]
     session: Option<String>,
 
-    /// 1-based turn index
+    /// 1-based turn index (numbered per local date)
     #[arg(long)]
     turn: Option<usize>,
+
+    /// Local date of the turn (YYYY-MM-DD), as reported by extract
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    date: Option<NaiveDate>,
 
     /// Review status (approved, rejected, deferred)
     #[arg(long, value_enum)]
@@ -132,7 +136,7 @@ struct MarkArgs {
     #[arg(long)]
     reason: Option<String>,
 
-    /// Batch input JSON file containing array of LedgerEntry
+    /// Batch input JSON file containing array of LedgerEntry (each needs a "date")
     #[arg(long, value_name = "PATH")]
     batch: Option<PathBuf>,
 
@@ -146,6 +150,18 @@ struct LedgerArgs {
     /// Target ledger file
     #[arg(long, value_name = "PATH")]
     ledger: Option<PathBuf>,
+
+    /// Add dates to legacy `session:turn_index` entries by matching them against the transcripts
+    #[arg(long)]
+    migrate: bool,
+
+    /// Root directory containing Claude Code project transcript files.
+    #[arg(long, default_value_os_t = default_projects_dir(), value_name = "PATH", requires = "migrate")]
+    projects_dir: PathBuf,
+
+    /// Boilerplate threshold; must match what extract used when the entries were made.
+    #[arg(long, default_value_t = 3, value_name = "N", requires = "migrate")]
+    boilerplate_threshold: usize,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -347,6 +363,7 @@ fn handle_mark(args: MarkArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(batch_path) = args.batch {
         let content = std::fs::read_to_string(batch_path)?;
         let entries: Vec<LedgerEntry> = serde_json::from_str(&content)?;
+        tutor::validate_batch_entries(&entries)?;
         let count = entries.len();
         for entry in entries {
             ledger.record(entry);
@@ -365,6 +382,10 @@ fn handle_mark(args: MarkArgs) -> Result<(), Box<dyn std::error::Error>> {
     let turn_index = args
         .turn
         .ok_or("error: --turn is required unless --batch is provided")?;
+    let date = args
+        .date
+        .ok_or("error: --date is required unless --batch is provided")?
+        .to_string();
     let status = args
         .status
         .ok_or("error: --status is required unless --batch is provided")?;
@@ -372,13 +393,14 @@ fn handle_mark(args: MarkArgs) -> Result<(), Box<dyn std::error::Error>> {
     let entry = LedgerEntry {
         session,
         turn_index,
+        date: Some(date.clone()),
         status,
         destination: args.destination,
         reason: args.reason,
         timestamp: Some(Local::now().to_rfc3339()),
     };
 
-    let key = Ledger::entry_key(&entry.session, entry.turn_index);
+    let key = Ledger::entry_key(&entry.session, &date, entry.turn_index);
     ledger.record(entry);
     ledger.save(&ledger_path)?;
     eprintln!(
@@ -391,10 +413,56 @@ fn handle_mark(args: MarkArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 fn handle_ledger(args: LedgerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ledger_path = args.ledger.unwrap_or_else(default_ledger_path);
+    if args.migrate {
+        return handle_ledger_migrate(&ledger_path, args.projects_dir, args.boilerplate_threshold);
+    }
     let ledger = Ledger::load(&ledger_path)?;
     let mut stdout = io::stdout().lock();
     serde_json::to_writer_pretty(&mut stdout, &ledger)?;
     writeln!(stdout)?;
+    Ok(())
+}
+
+fn handle_ledger_migrate(
+    ledger_path: &std::path::Path,
+    projects_dir: PathBuf,
+    boilerplate_threshold: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Dates are overridden by the migration (it scans all of them).
+    let config = Config {
+        dates: DateRange::single(Local::now().date_naive()),
+        projects_dir,
+        boilerplate_threshold,
+        context_chars: 600,
+        tools_window: 20,
+        fixed_offset: None,
+        ledger_path: None,
+        project_filter: None,
+        cwd_filter: None,
+        human_filter: Vec::new(),
+    };
+    let mut stderr = io::stderr().lock();
+    let report = tutor::migrate_ledger(&config, ledger_path, &mut stderr)?;
+    writeln!(
+        stderr,
+        "tutor: migrated {}, ambiguous {}, not found {}, repaired {} in {}",
+        report.migrated.len(),
+        report.ambiguous.len(),
+        report.not_found.len(),
+        report.repaired.len(),
+        ledger_path.display()
+    )?;
+    for (label, keys) in [
+        ("ambiguous", &report.ambiguous),
+        ("not found", &report.not_found),
+    ] {
+        for key in keys {
+            writeln!(stderr, "tutor: kept as is ({label}): {key}")?;
+        }
+    }
+    if let Some(backup) = &report.backup {
+        writeln!(stderr, "tutor: backup written to {}", backup.display())?;
+    }
     Ok(())
 }
 

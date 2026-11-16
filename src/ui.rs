@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{JudgmentStatus, Ledger, LedgerEntry, OutputTurn};
+use crate::{JudgmentStatus, Ledger, LedgerEntry, OutputTurn, parse_ledger_date};
 
 pub const UI_HTML: &str = include_str!("ui.html");
 
@@ -12,6 +12,9 @@ pub const UI_HTML: &str = include_str!("ui.html");
 pub struct ReviewItem {
     pub session: String,
     pub turn_index: usize,
+    /// Local date of the turn, as given by `tutor_extract`. `turn_index` is only unique per date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,11 +46,41 @@ fn default_destination() -> String {
     "project_claude".to_string()
 }
 
+impl ReviewItem {
+    /// The date to record this item under: `date`, or for items without one the first 10
+    /// characters of `timestamp_local`. `None` when neither gives a valid `YYYY-MM-DD`.
+    pub fn ledger_date(&self) -> Option<String> {
+        let text = match &self.date {
+            Some(date) => date.as_str(),
+            None => self.timestamp_local.as_deref()?.get(..10)?,
+        };
+        parse_ledger_date(text).ok().map(|date| date.to_string())
+    }
+}
+
+/// Items that cannot be recorded because they have no valid date, as `#index (session:turn)`.
+pub fn undated_items(items: &[ReviewItem]) -> Vec<String> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.ledger_date().is_none())
+        .map(|(index, item)| format!("#{index} ({}:{})", item.session, item.turn_index))
+        .collect()
+}
+
+fn undated_message(undated: &[String]) -> String {
+    format!(
+        "items need a valid 'date' (YYYY-MM-DD, from tutor_extract) or a 'timestamp_local'; missing or invalid for: {}",
+        undated.join(", ")
+    )
+}
+
 impl From<OutputTurn> for ReviewItem {
     fn from(turn: OutputTurn) -> Self {
         Self {
             session: turn.session,
             turn_index: turn.turn_index,
+            date: Some(turn.date),
             project_dir: Some(turn.project_dir),
             cwd: Some(turn.cwd),
             timestamp_local: Some(turn.timestamp_local),
@@ -81,6 +114,17 @@ pub fn run_review_ui(
     ledger_path: Option<&Path>,
     destinations: Option<Vec<crate::DestinationDef>>,
 ) -> io::Result<Vec<ReviewItem>> {
+    // Refuse before opening anything: an item without a date cannot be recorded safely, and
+    // dropping it after the user submitted would make the turn reappear in later extracts.
+    if ledger_path.is_some() {
+        let undated = undated_items(&items);
+        if !undated.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                undated_message(&undated),
+            ));
+        }
+    }
     let port = port.unwrap_or(0);
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let local_addr = listener.local_addr()?;
@@ -106,6 +150,7 @@ pub fn run_review_ui(
                     &mut stream,
                     &items_json,
                     &destinations_json,
+                    ledger_path.is_some(),
                     &mut submitted_items,
                 ) {
                     eprintln!("tutor ui: connection error: {e}");
@@ -123,6 +168,10 @@ pub fn run_review_ui(
     if let Some(path) = ledger_path {
         let mut ledger = Ledger::load(path).unwrap_or_default();
         for item in &results {
+            // Checked at start and on submit, so this cannot be hit.
+            let Some(date) = item.ledger_date() else {
+                unreachable!("undated items are rejected before recording");
+            };
             let status = match item.status.as_str() {
                 "approved" => JudgmentStatus::Approved,
                 "rejected" => JudgmentStatus::Rejected,
@@ -138,6 +187,7 @@ pub fn run_review_ui(
             ledger.record(LedgerEntry {
                 session: item.session.clone(),
                 turn_index: item.turn_index,
+                date: Some(date),
                 status,
                 destination: Some(item.destination.clone()),
                 reason,
@@ -156,6 +206,7 @@ fn handle_connection(
     stream: &mut TcpStream,
     items_json: &str,
     destinations_json: &str,
+    require_dates: bool,
     submitted: &mut Option<Vec<ReviewItem>>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -221,6 +272,18 @@ fn handle_connection(
             reader.read_exact(&mut body_bytes)?;
 
             match serde_json::from_slice::<SubmitPayload>(&body_bytes) {
+                Ok(payload) if require_dates && !undated_items(&payload.items).is_empty() => {
+                    let err_msg = serde_json::json!({
+                        "error": undated_message(&undated_items(&payload.items))
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        err_msg.len(),
+                        err_msg
+                    );
+                    stream.write_all(response.as_bytes())?;
+                }
                 Ok(payload) => {
                     *submitted = Some(payload.items);
                     let body = b"{\"status\":\"ok\"}";

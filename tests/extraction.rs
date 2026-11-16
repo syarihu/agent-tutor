@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use chrono::{FixedOffset, NaiveDate};
 use tutor::{
     Config, DateRange, JudgmentStatus, Ledger, LedgerEntry, OutputFormat, extract, list_projects,
-    resolve_date_range, write_output,
+    migrate_ledger, resolve_date_range, validate_batch_entries, write_output,
 };
 
 fn fixture_root() -> PathBuf {
@@ -290,6 +290,7 @@ fn skips_reviewed_turns_when_ledger_is_present() {
     ledger.record(LedgerEntry {
         session: "test-session-1".to_owned(),
         turn_index: 1,
+        date: Some("2026-09-17".into()),
         status: JudgmentStatus::Approved,
         destination: Some("project_claude".into()),
         reason: Some("fixed header typo convention".into()),
@@ -298,6 +299,7 @@ fn skips_reviewed_turns_when_ledger_is_present() {
     ledger.record(LedgerEntry {
         session: "test-session-2".to_owned(),
         turn_index: 1,
+        date: Some("2026-09-17".into()),
         status: JudgmentStatus::Rejected,
         destination: Some("discard".into()),
         reason: Some("routine check".into()),
@@ -306,6 +308,7 @@ fn skips_reviewed_turns_when_ledger_is_present() {
     ledger.record(LedgerEntry {
         session: "test-session-1".to_owned(),
         turn_index: 2,
+        date: Some("2026-09-17".into()),
         status: JudgmentStatus::Deferred,
         destination: None,
         reason: Some("need more context".into()),
@@ -854,4 +857,381 @@ fn grep_folds_sigma_forms() {
         let turns = extract(&cfg, &mut warnings).unwrap();
         assert_eq!(humans(&turns), expected, "{pattern}");
     }
+}
+
+// --- Ledger keys include the local date -------------------------------------------------------
+
+const JST: i32 = 9 * 60 * 60;
+
+/// One session across local midnight (UTC+9): two turns on 09-10 and two on 09-11.
+fn midnight_fixture() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    write_session(
+        temp.path(),
+        "proj-mid",
+        "mid.jsonl",
+        &[
+            ("mid", "2026-09-10T14:00:00Z", "d1 first"),
+            ("mid", "2026-09-10T14:30:00Z", "d1 second"),
+            ("mid", "2026-09-10T15:30:00Z", "d2 first"),
+            ("mid", "2026-09-10T16:00:00Z", "d2 second"),
+        ],
+    );
+    temp
+}
+
+fn jst_config(root: &Path, dates: DateRange, ledger: Option<PathBuf>) -> Config {
+    let mut cfg = config(root.to_owned(), JST);
+    cfg.dates = dates;
+    cfg.ledger_path = ledger;
+    cfg
+}
+
+fn entry(session: &str, date: Option<&str>, turn: usize, status: JudgmentStatus) -> LedgerEntry {
+    LedgerEntry {
+        session: session.to_owned(),
+        turn_index: turn,
+        date: date.map(str::to_owned),
+        status,
+        destination: None,
+        reason: None,
+        timestamp: None,
+    }
+}
+
+fn humans_of(cfg: &Config) -> Vec<String> {
+    extract(cfg, &mut Vec::new())
+        .unwrap()
+        .into_iter()
+        .map(|turn| turn.human)
+        .collect()
+}
+
+#[test]
+fn approving_day_one_turn_leaves_the_same_index_on_day_two() {
+    let temp = midnight_fixture();
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = Ledger::default();
+    ledger.record(entry(
+        "mid",
+        Some("2026-09-10"),
+        1,
+        JudgmentStatus::Approved,
+    ));
+    ledger.save(&ledger_path).unwrap();
+
+    let ledger = Some(ledger_path);
+    let day1 = jst_config(temp.path(), DateRange::single(d(10)), ledger.clone());
+    let day2 = jst_config(temp.path(), DateRange::single(d(11)), ledger.clone());
+    let range = jst_config(temp.path(), DateRange::new(d(10), d(11)).unwrap(), ledger);
+
+    assert_eq!(humans_of(&day1), ["d1 second"]);
+    assert_eq!(humans_of(&day2), ["d2 first", "d2 second"]);
+    assert_eq!(humans_of(&range), ["d1 second", "d2 first", "d2 second"]);
+
+    let projects = list_projects(&range, &mut Vec::new()).unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].turns_count, 3);
+    let daily = projects[0].daily_counts.as_ref().unwrap();
+    assert_eq!(daily["2026-09-10"], 1);
+    assert_eq!(daily["2026-09-11"], 2);
+}
+
+#[test]
+fn output_turns_carry_their_local_date() {
+    let temp = midnight_fixture();
+    let cfg = jst_config(temp.path(), DateRange::new(d(10), d(11)).unwrap(), None);
+    let turns = extract(&cfg, &mut Vec::new()).unwrap();
+    let dates: Vec<_> = turns
+        .iter()
+        .map(|t| (t.date.as_str(), t.turn_index))
+        .collect();
+    assert_eq!(
+        dates,
+        [
+            ("2026-09-10", 1),
+            ("2026-09-10", 2),
+            ("2026-09-11", 1),
+            ("2026-09-11", 2)
+        ]
+    );
+    let mut out = Vec::new();
+    write_output(&turns[..1], OutputFormat::Jsonl, &mut out).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(json["date"], "2026-09-10");
+}
+
+#[test]
+fn marking_both_days_keeps_two_entries() {
+    let temp = midnight_fixture();
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = Ledger::default();
+    ledger.record(entry(
+        "mid",
+        Some("2026-09-10"),
+        1,
+        JudgmentStatus::Approved,
+    ));
+    ledger.record(entry(
+        "mid",
+        Some("2026-09-11"),
+        1,
+        JudgmentStatus::Rejected,
+    ));
+    ledger.save(&ledger_path).unwrap();
+
+    let loaded = Ledger::load(&ledger_path).unwrap();
+    assert_eq!(loaded.entries.len(), 2);
+    assert_eq!(
+        loaded.entries["mid:2026-09-10:1"].status,
+        JudgmentStatus::Approved
+    );
+    assert_eq!(
+        loaded.entries["mid:2026-09-11:1"].status,
+        JudgmentStatus::Rejected
+    );
+
+    let range = jst_config(
+        temp.path(),
+        DateRange::new(d(10), d(11)).unwrap(),
+        Some(ledger_path),
+    );
+    assert_eq!(humans_of(&range), ["d1 second", "d2 second"]);
+}
+
+#[test]
+fn dated_deferred_entry_beats_legacy_approved() {
+    let mut ledger = Ledger::default();
+    ledger.record(entry("s", None, 1, JudgmentStatus::Approved));
+    assert!(ledger.is_reviewed("s", "2026-09-10", 1));
+    ledger.record(entry("s", Some("2026-09-10"), 1, JudgmentStatus::Deferred));
+    assert!(!ledger.is_reviewed("s", "2026-09-10", 1));
+    // Other dates still fall back to the legacy entry.
+    assert!(ledger.is_reviewed("s", "2026-09-11", 1));
+}
+
+#[test]
+fn old_format_ledger_still_hides_turns_and_keeps_its_keys() {
+    let temp = midnight_fixture();
+    let ledger_path = temp.path().join("ledger.json");
+    fs::write(
+        &ledger_path,
+        r#"{"entries":{"mid:1":{"session":"mid","turn_index":1,"status":"approved","destination":"discard","timestamp":"2026-09-12T00:00:00+09:00"}}}"#,
+    )
+    .unwrap();
+
+    let range = jst_config(
+        temp.path(),
+        DateRange::new(d(10), d(11)).unwrap(),
+        Some(ledger_path.clone()),
+    );
+    // The legacy entry keeps hiding turn 1 on both days until it is migrated.
+    assert_eq!(humans_of(&range), ["d1 second", "d2 second"]);
+
+    let ledger = Ledger::load(&ledger_path).unwrap();
+    ledger.save(&ledger_path).unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&ledger_path).unwrap()).unwrap();
+    let entries = saved["entries"].as_object().unwrap();
+    assert_eq!(entries.keys().collect::<Vec<_>>(), ["mid:1"]);
+    assert!(entries["mid:1"].get("date").is_none());
+}
+
+fn backups_of(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("ledger.json.bak-"))
+        })
+        .collect()
+}
+
+fn legacy(session: &str, turn: usize, timestamp: Option<&str>) -> LedgerEntry {
+    LedgerEntry {
+        timestamp: timestamp.map(str::to_owned),
+        ..entry(session, None, turn, JudgmentStatus::Approved)
+    }
+}
+
+#[test]
+fn migrates_unambiguous_entries_and_writes_a_backup() {
+    let temp = midnight_fixture();
+    write_session(
+        temp.path(),
+        "proj-solo",
+        "solo.jsonl",
+        &[("solo", "2026-09-10T01:00:00Z", "only turn")],
+    );
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = Ledger::default();
+    ledger.record(legacy("solo", 1, Some("2026-09-11T00:00:00Z")));
+    ledger.save(&ledger_path).unwrap();
+    let before = fs::read_to_string(&ledger_path).unwrap();
+
+    let cfg = config(temp.path().to_owned(), JST);
+    let report = migrate_ledger(&cfg, &ledger_path, &mut Vec::new()).unwrap();
+    assert_eq!(report.migrated, ["solo:1"]);
+    assert!(report.ambiguous.is_empty() && report.not_found.is_empty());
+
+    let ledger = Ledger::load(&ledger_path).unwrap();
+    assert_eq!(ledger.entries.len(), 1);
+    let migrated = &ledger.entries["solo:2026-09-10:1"];
+    assert_eq!(migrated.date.as_deref(), Some("2026-09-10"));
+
+    let backups = backups_of(temp.path());
+    assert_eq!(backups.len(), 1);
+    assert_eq!(fs::read_to_string(&backups[0]).unwrap(), before);
+    assert_eq!(report.backup.as_deref(), Some(backups[0].as_path()));
+}
+
+#[test]
+fn keeps_ambiguous_entries_and_uses_mark_time_to_disambiguate() {
+    let temp = midnight_fixture();
+    let ledger_path = temp.path().join("ledger.json");
+    let cfg = config(temp.path().to_owned(), JST);
+
+    // Marked after both days' turn 1 existed: cannot tell which one was meant.
+    let mut ledger = Ledger::default();
+    ledger.record(legacy("mid", 1, Some("2026-09-12T00:00:00Z")));
+    ledger.save(&ledger_path).unwrap();
+    let report = migrate_ledger(&cfg, &ledger_path, &mut Vec::new()).unwrap();
+    assert_eq!(report.ambiguous, ["mid:1"]);
+    assert!(report.migrated.is_empty());
+    assert!(backups_of(temp.path()).is_empty());
+    assert!(
+        Ledger::load(&ledger_path)
+            .unwrap()
+            .entries
+            .contains_key("mid:1")
+    );
+
+    // Marked before day 2's turn 1 was written: it must have been day 1's.
+    let mut ledger = Ledger::default();
+    ledger.record(legacy("mid", 1, Some("2026-09-10T14:10:00Z")));
+    ledger.save(&ledger_path).unwrap();
+    let report = migrate_ledger(&cfg, &ledger_path, &mut Vec::new()).unwrap();
+    assert_eq!(report.migrated, ["mid:1"]);
+    let ledger = Ledger::load(&ledger_path).unwrap();
+    assert!(ledger.entries.contains_key("mid:2026-09-10:1"));
+    assert!(!ledger.entries.contains_key("mid:1"));
+}
+
+#[test]
+fn keeps_entries_whose_transcript_is_missing() {
+    let temp = midnight_fixture();
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = Ledger::default();
+    ledger.record(legacy("gone", 1, None));
+    ledger.save(&ledger_path).unwrap();
+
+    let report = migrate_ledger(
+        &config(temp.path().to_owned(), JST),
+        &ledger_path,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(report.not_found, ["gone:1"]);
+    assert!(
+        Ledger::load(&ledger_path)
+            .unwrap()
+            .entries
+            .contains_key("gone:1")
+    );
+    assert!(backups_of(temp.path()).is_empty());
+}
+
+#[test]
+fn migration_prefers_an_existing_dated_entry() {
+    let temp = midnight_fixture();
+    write_session(
+        temp.path(),
+        "proj-solo",
+        "solo.jsonl",
+        &[("solo", "2026-09-10T01:00:00Z", "only turn")],
+    );
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = Ledger::default();
+    ledger.record(legacy("solo", 1, None));
+    ledger.record(entry(
+        "solo",
+        Some("2026-09-10"),
+        1,
+        JudgmentStatus::Deferred,
+    ));
+    ledger.save(&ledger_path).unwrap();
+
+    migrate_ledger(
+        &config(temp.path().to_owned(), JST),
+        &ledger_path,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let ledger = Ledger::load(&ledger_path).unwrap();
+    assert_eq!(ledger.entries.len(), 1);
+    assert_eq!(
+        ledger.entries["solo:2026-09-10:1"].status,
+        JudgmentStatus::Deferred
+    );
+}
+
+#[test]
+fn repairs_dated_keys_that_lost_their_date() {
+    let temp = midnight_fixture();
+    let ledger_path = temp.path().join("ledger.json");
+    fs::write(
+        &ledger_path,
+        r#"{"entries":{"mid:2026-09-11:1":{"session":"mid","turn_index":1,"status":"rejected"}}}"#,
+    )
+    .unwrap();
+
+    let report = migrate_ledger(
+        &config(temp.path().to_owned(), JST),
+        &ledger_path,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(report.repaired, ["mid:2026-09-11:1"]);
+    let ledger = Ledger::load(&ledger_path).unwrap();
+    assert_eq!(
+        ledger.entries["mid:2026-09-11:1"].date.as_deref(),
+        Some("2026-09-11")
+    );
+    assert_eq!(backups_of(temp.path()).len(), 1);
+}
+
+#[test]
+fn rejects_batch_entries_without_a_valid_date() {
+    let good = entry("s", Some("2026-09-10"), 1, JudgmentStatus::Approved);
+    let missing = entry("s", None, 2, JudgmentStatus::Approved);
+    let malformed = entry("s", Some("2026-9-1"), 3, JudgmentStatus::Approved);
+    assert!(validate_batch_entries(std::slice::from_ref(&good)).is_ok());
+    let error = validate_batch_entries(&[good, missing, malformed]).unwrap_err();
+    assert!(error.contains("1, 2"), "{error}");
+}
+
+#[test]
+fn mark_batch_without_dates_fails_and_writes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let batch = temp.path().join("batch.json");
+    let ledger_path = temp.path().join("ledger.json");
+    fs::write(
+        &batch,
+        r#"[{"session":"s","turn_index":1,"date":"2026-09-10","status":"approved"},{"session":"s","turn_index":2,"status":"approved"}]"#,
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tutor"))
+        .args(["mark", "--batch"])
+        .arg(&batch)
+        .arg("--ledger")
+        .arg(&ledger_path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("index(es): 1"), "{stderr}");
+    assert!(!ledger_path.exists());
 }
